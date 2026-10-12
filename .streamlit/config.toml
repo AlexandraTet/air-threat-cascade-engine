@@ -1,10 +1,55 @@
+# Tactical-minimalist theme for the Air-Threat Cascade evaluation console.
+# Colours, typography, radii and borders are defined natively here; a small
+# CSS layer in src/dashboard.py (inject_tactical_css) only adds spacing and
+# emphasis the theme API cannot express.
+
 [theme]
-# Pinned so the page and st.context.theme agree; the map renderer picks its
-# light/dark palette from the detected theme.
-base = "light"
-primaryColor = "#2E86AB"
-headingFont = "Inter, sans-serif"
-baseRadius = "medium"
+# Pinned so the page and the matplotlib palette agree (see _theme_is_dark).
+base = "dark"
+primaryColor = "#2F80ED"
+backgroundColor = "#0F141A"
+secondaryBackgroundColor = "#161C24"
+textColor = "#E6EBF0"
+linkColor = "#7CB7FF"
+linkUnderline = false
+borderColor = "#2A3340"
+codeBackgroundColor = "#111820"
+codeTextColor = "#D8E1EA"
+dataframeBorderColor = "#2A3340"
+dataframeHeaderBackgroundColor = "#161C24"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "10px"
+buttonRadius = "8px"
+
+# Semantic palette (fast-wave red, slow-wave blue, target orange, success green).
+redColor = "#E5484D"
+blueColor = "#4C9BE8"
+orangeColor = "#F2994A"
+greenColor = "#3CCB7F"
+violetColor = "#A78BFA"
+yellowColor = "#E8C547"
+grayColor = "#8B98A5"
+chartCategoricalColors = ["#E5484D", "#4C9BE8", "#F2994A", "#3CCB7F", "#A78BFA", "#8B98A5", "#E8C547"]
+
+# Typography: Inter for UI, JetBrains Mono for code/JSON. Falls back to system
+# fonts when Google Fonts is unreachable (offline demos still render).
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 15
+baseFontWeight = 400
+codeFontSize = "0.85rem"
+headingFontSizes = ["30px", "22px", "18px", "16px", "14px", "12px"]
+headingFontWeights = [700, 600, 600, 600, 500, 500]
+
+[theme.sidebar]
+backgroundColor = "#0B1015"
+secondaryBackgroundColor = "#141A22"
+codeBackgroundColor = "#0F141A"
+textColor = "#D5DCE3"
+borderColor = "#232C37"
+primaryColor = "#2F80ED"
 
 [server]
 headless = true

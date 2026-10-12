@@ -380,8 +380,8 @@ class AppSmokeTests(unittest.TestCase):
         self.assertFalse(at.exception, msg=str(at.exception))
         self.assertTrue(any("No alarms recorded before T" in str(i.value) for i in at.info))
         self.assertTrue(any("before the first recorded alarm" in str(w.value) for w in at.warning))
-        # Overview KPIs are absent; only the methodology tab's audit callouts remain.
-        self.assertFalse(any(m.label == "Alarms before T" for m in at.metric))
+        # The system-indicator strip stays visible and reports an empty slice.
+        self.assertTrue(any(m.label == "Alarms before T" and str(m.value) == "0" for m in at.metric))
         self.assertTrue(any(m.label == "Withheld (start ≥ T)" for m in at.metric))
         # The wave map still renders on the default topology in what-if mode.
         self.assertTrue(any("Default topology in use" in str(w.value) or "default topology" in str(w.value)
@@ -410,8 +410,8 @@ class AppSmokeTests(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception, msg=str(at.exception))
         self.assertTrue(any("threat filter hides" in str(i.value) for i in at.info))
-        # Overview KPIs are absent; only the methodology tab's audit callouts remain.
-        self.assertFalse(any(m.label == "Alarms before T" for m in at.metric))
+        # The system-indicator strip stays visible and reports an empty slice.
+        self.assertTrue(any(m.label == "Alarms before T" and str(m.value) == "0" for m in at.metric))
         self.assertTrue(any(m.label == "Withheld (start ≥ T)" for m in at.metric))
 
     def test_osint_parse_button_injects_triggers(self) -> None:

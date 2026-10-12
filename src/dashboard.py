@@ -1151,31 +1151,23 @@ def render_empty_state(
 
 
 def render_overview_tab(df: pd.DataFrame, active: pd.DataFrame, cutoff: pd.Timestamp) -> None:
-    """Tab 1: KPI row, temporal charts, wave mix and recent alarms.
+    """Tab 1: temporal charts, wave mix and recent alarms.
+
+    The headline indicators live in the strip above the tabs
+    (:func:`render_system_indicators`); this tab breaks the slice down.
 
     Args:
         df: Filtered, cutoff-safe alarm frame (non-empty).
         active: Alarms active at ``T``.
         cutoff: Observation instant ``T``.
     """
-    current, previous = cascade_velocity(df, cutoff)
-    delta = current - previous
-    wave_share = df["wave_class"].value_counts(normalize=True)
-    fast_share = float(wave_share.get(ThreatWave.FAST.value, 0.0))
-
-    with st.container(horizontal=True):
-        st.metric("Alarms before T", f"{len(df):,}", border=True,
-                  help="Rows with start_time strictly before T after filters.")
-        st.metric("Active at T", f"{len(active):,}", border=True,
-                  delta=f"{active['region'].nunique()} regions" if len(active) else None,
-                  delta_arrow="off", help=f"Open-ended alarms started within the last "
-                  f"{ACTIVE_WINDOW_HOURS:.0f} h before T.")
-        st.metric("Cascade velocity", f"{current:.1f} /h", delta=f"{delta:+.1f} vs prior 6 h",
-                  border=True, chart_data=hourly_onsets(df, cutoff), chart_type="bar",
-                  help="Alarm onsets per hour in the 6 h before T; sparkline shows the last 24 h.")
-        st.metric("Fast-wave share", f"{fast_share:.0%}", border=True,
-                  delta=f"{1 - fast_share:.0%} slow-wave", delta_arrow="off",
-                  help="Share of ballistic / aviation / cruise alarms among visible rows.")
+    st.caption(
+        f"Breakdown of the {len(df):,} alarms visible before T = {cutoff:%Y-%m-%d %H:%M} UTC · "
+        f"{len(active)} active now · "
+        "<span class='tsa-fast'>fast-wave</span> vs <span class='tsa-slow'>slow-wave</span> "
+        "colouring is consistent across every chart and the map.",
+        unsafe_allow_html=True,
+    )
 
     col_left, col_right = st.columns((3, 2))
     with col_left, st.container(border=True):
@@ -1333,16 +1325,18 @@ def render_wave_map_tab(
                      icon=":material/hub:", color="green" if graph.graph.get("source") == "observed" else "violet")
 
     base_map = load_base_map()
-    fig = render_wave_map_figure(
-        graphs, layers=layers, activity=activity, active_regions=list(active["region"].unique()),
-        trigger=trigger, predictions=predictions, min_probability=float(min_probability),
-        max_edges_per_layer=int(max_edges), show_edge_labels=bool(edge_labels),
-        show_node_labels=bool(node_labels), show_map=bool(map_underlay), base_map=base_map,
-        title=f"Wave map at T = {cutoff:%Y-%m-%d %H:%M} UTC", dark=_theme_is_dark(),
-    )
-    st.pyplot(fig)
-    plt.close(fig)
-    st.caption(f"Base map: {base_map.description}.")
+    with st.spinner("Rendering wave map…"):
+        fig = render_wave_map_figure(
+            graphs, layers=layers, activity=activity, active_regions=list(active["region"].unique()),
+            trigger=trigger, predictions=predictions, min_probability=float(min_probability),
+            max_edges_per_layer=int(max_edges), show_edge_labels=bool(edge_labels),
+            show_node_labels=bool(node_labels), show_map=bool(map_underlay), base_map=base_map,
+            title=f"Wave map at T = {cutoff:%Y-%m-%d %H:%M} UTC", dark=_theme_is_dark(),
+        )
+        st.pyplot(fig)
+        plt.close(fig)
+    st.caption(f"Base map: {base_map.description}. Hover any control for guidance; the star marks the "
+               "selected trigger and orange tags are arrival estimates.")
 
     col_pred, col_layers = st.columns((3, 2))
     with col_pred, st.container(border=True):
@@ -1426,24 +1420,39 @@ def get_osint_parser() -> GeminiOSINTParser:
 
 
 def _run_osint_pipeline() -> None:
-    """Button callback: parse the pasted message and switch the simulator to it.
+    """Button callback: queue the pasted message for parsing on this rerun.
 
-    Runs before the script reruns, so it may update the trigger-mode widget's
-    session state. Never raises: parser failures degrade to rules, and any
-    unexpected error is stored for display.
+    Runs before the script reruns, so it may switch the trigger-mode widget's
+    session state to ``"osint"``. The parse itself happens in
+    :func:`_parse_pending_osint` during the rerun so a spinner can be shown.
     """
     text = str(st.session_state.get("osint_text", "")).strip()
     st.session_state["osint_error"] = None
+    st.session_state["osint_pending"] = False
     if not text:
         st.session_state["osint_result"] = None
         st.session_state["osint_error"] = "Paste a monitoring message first."
         return
+    st.session_state["osint_pending"] = True
+    st.session_state["sim_trigger_mode"] = "osint"
+
+
+def _parse_pending_osint() -> None:
+    """Parse the queued message under a spinner. Never raises.
+
+    Parser failures degrade to the rule-based engine inside
+    :class:`GeminiOSINTParser`; any unexpected error is stored for display.
+    """
+    if not st.session_state.get("osint_pending"):
+        return
+    st.session_state["osint_pending"] = False
+    text = str(st.session_state.get("osint_text", "")).strip()
     try:
-        parser = get_osint_parser()
-        record = parser.parse(text)
-        st.session_state["osint_result"] = record.model_dump(mode="json")
-        st.session_state["osint_status"] = parser.status()
-        st.session_state["sim_trigger_mode"] = "osint"
+        with st.spinner("Parsing OSINT message with Gemini (rule-based fallback if offline)…"):
+            parser = get_osint_parser()
+            record = parser.parse(text)
+            st.session_state["osint_result"] = record.model_dump(mode="json")
+            st.session_state["osint_status"] = parser.status()
     except Exception as exc:  # noqa: BLE001 - UI must never crash on parser issues
         logger.exception("OSINT pipeline failed")
         st.session_state["osint_result"] = None
@@ -1491,25 +1500,33 @@ def render_osint_input() -> Optional[dict[str, Any]]:
     Returns:
         The parsed record payload stored in session state, or ``None``.
     """
-    with st.container(border=True):
+    with st.container(border=True, key="osint_card"):
         st.subheader("Multimodal OSINT input", icon=":material/translate:")
-        st.caption(
-            "Paste a raw monitoring-channel update (Ukrainian / Russian / English slang is fine). "
-            "Gemini normalises it into threat type, source and target oblasts with a confidence "
-            "score; without an API key the rule-based parser runs instead. Parsed regions become "
-            "triggers active at T."
+        st.info(
+            "**How it works:** paste a raw monitoring-channel update (Ukrainian / Russian / English "
+            "slang is fine) and press the button. Gemini normalises it into threat type, source and "
+            "target oblasts with a confidence score; without an API key the rule-based parser runs "
+            "instead. Parsed oblasts are injected as triggers active at **T** and the cascade below "
+            "recomputes immediately.",
+            icon=":material/lightbulb:",
         )
         with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
             st.selectbox("Example message", demo_messages(), key="osint_example",
-                         format_func=lambda m: m[:70] + ("…" if len(m) > 70 else ""))
+                         format_func=lambda m: m[:70] + ("…" if len(m) > 70 else ""),
+                         help="Built-in Telegram-style samples covering each threat class.")
             st.button("Use example", icon=":material/content_paste:", on_click=_load_osint_example,
-                      key="osint_use_example")
+                      key="osint_use_example", help="Copy the selected sample into the message box.")
         st.text_area(
             "Raw monitoring message", key="osint_text", height=110,
             placeholder="⚠️ Сумщина: 6 мопедів курсом на Полтавщину, швидкість ~150 км/год",
+            help="Free text as posted by a monitoring channel. Emoji, abbreviations and mixed "
+                 "languages are expected; nothing is sent anywhere unless a Gemini key is configured.",
         )
         st.button("⚡ Parse OSINT & Run Cascade Simulation", type="primary", key="osint_run",
-                  on_click=_run_osint_pipeline, width="stretch")
+                  on_click=_run_osint_pipeline, width="stretch",
+                  help="Parse the message, switch the trigger source to the OSINT record and rerun "
+                       "the Top-K prediction.")
+        _parse_pending_osint()
 
         error = st.session_state.get("osint_error")
         if error:
@@ -1563,10 +1580,13 @@ def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Tim
         wave_graphs: Optional per-wave graphs; when an OSINT record has a known
             wave class its layer is used so the propagation view matches it.
     """
-    st.caption(
-        "Each successor's chance is the empirical P(target | trigger) discounted once the typical "
-        "lag has elapsed; multiple triggers combine with a noisy-OR. Arrival estimates are median "
-        "historical lags measured from each trigger's start."
+    st.info(
+        "**Three ways to seed the cascade:** *Observed alarms at T* uses what is live right now, "
+        "*What-if regions* lets you place hypothetical triggers, and *OSINT message* injects the "
+        "oblasts parsed from a pasted report. Each successor's chance is the empirical "
+        "P(target | trigger) discounted once its typical lag has elapsed; several triggers combine "
+        "with a noisy-OR, and arrival estimates are median historical lags from each trigger's start.",
+        icon=":material/route:",
     )
     record = render_osint_input()
 
@@ -1672,13 +1692,15 @@ def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Tim
     highlight: dict[str, tuple[str, float]] = {r: ("#D1495B", 1.0) for r, _, _ in triggers}
     for row in predictions.itertuples(index=False):
         highlight[str(row.region)] = ("#F2A541", float(0.35 + 0.65 * row.probability))
-    fig = render_graph_figure(
-        sim_graph, highlight=highlight,
-        min_weight=1 if sim_graph.graph.get("source") == "prior" else params.min_edge_weight,
-        max_edges=60, title=f"Simulated cascade at T · {_TRIGGER_MODES[mode]}", dark=_theme_is_dark(),
-    )
-    st.pyplot(fig)
-    plt.close(fig)
+    with st.spinner("Rendering cascade view…"):
+        fig = render_graph_figure(
+            sim_graph, highlight=highlight,
+            min_weight=1 if sim_graph.graph.get("source") == "prior" else params.min_edge_weight,
+            max_edges=60, title=f"Simulated cascade at T · {_TRIGGER_MODES[mode]}",
+            dark=_theme_is_dark(),
+        )
+        st.pyplot(fig)
+        plt.close(fig)
 
     if not predictions.empty:
         with st.container(border=True):
@@ -1789,20 +1811,15 @@ def render_methodology_tab(
         "cutoff **T**, so the numbers below are a live audit of the current slice."
     )
 
-    kpi = st.columns(5)
-    with kpi[0]:
+    with st.container(horizontal=True, key="method_kpis", gap="small"):
         st.metric("Visible before T", f"{len(outcome.frame):,}", border=True,
                   help="Rows with start_time strictly before T (before threat filters).")
-    with kpi[1]:
         st.metric("Withheld (start ≥ T)", f"{outcome.withheld_rows:,}", border=True,
                   help="Future rows removed by the loader; they never reach any computation.")
-    with kpi[2]:
         st.metric("Ends masked at T", f"{outcome.masked_end_rows:,}", border=True,
                   help="Alarms still running at T whose end would be future knowledge.")
-    with kpi[3]:
         st.metric("Edges fast · slow", f"{observed_fast:,} · {observed_slow:,}", border=True,
                   help="Directed propagation edges learned from pre-T alarms per wave layer.")
-    with kpi[4]:
         st.metric("OSINT parser", "Gemini" if settings.llm_enabled else "Offline",
                   delta=settings.gemini_model if settings.llm_enabled else "rule-based (no API key)",
                   delta_arrow="off", border=True,
@@ -1997,6 +2014,111 @@ def render_methodology_tab(
 
 
 # --------------------------------------------------------------------------- #
+# 4c. Tactical-minimalist presentation layer
+# --------------------------------------------------------------------------- #
+TACTICAL_CSS: Final[str] = """
+<style>
+/* Theme colours live in .streamlit/config.toml; this layer only adds spacing,
+   emphasis and wrap behaviour. Selectors are scoped to keyed containers
+   (.st-key-*) or stable data-testid hooks. */
+:root {
+  --tsa-fast: #E5484D;
+  --tsa-slow: #4C9BE8;
+  --tsa-accent: #2F80ED;
+  --tsa-muted: #8B98A5;
+}
+.block-container { padding-top: 1.6rem; padding-bottom: 2.5rem; }
+
+/* Hero header: accent rail + tighter title tracking. */
+.st-key-hero { border-left: 4px solid var(--tsa-accent); padding-left: 1rem; }
+.st-key-hero h1 { letter-spacing: -0.02em; margin-bottom: 0.1rem; }
+
+/* Metric cards: compact uppercase labels that wrap instead of clipping. */
+[data-testid="stMetric"] { padding: 0.85rem 1rem; border-radius: 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 6px 18px rgba(0,0,0,0.18); }
+[data-testid="stMetricLabel"] { text-transform: uppercase; letter-spacing: 0.08em;
+  font-size: 0.72rem; color: var(--tsa-muted); white-space: normal !important; }
+[data-testid="stMetricLabel"] p { white-space: normal !important; overflow: visible !important; }
+[data-testid="stMetricValue"] { font-weight: 700; letter-spacing: -0.01em; font-size: 1.75rem; }
+[data-testid="stMetricValue"] > div { font-size: 1.75rem; line-height: 1.15; white-space: normal; }
+
+/* KPI strips: cards share the row and wrap at a sensible minimum width. */
+.st-key-kpi_strip [data-testid="stElementContainer"]:has([data-testid="stMetric"]),
+.st-key-method_kpis [data-testid="stElementContainer"]:has([data-testid="stMetric"]) {
+  flex: 1 1 180px; min-width: 170px; max-width: 320px; }
+
+/* Cards, tabs, badges, headings. */
+[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px; }
+[data-testid="stTabs"] [role="tab"] { font-weight: 600; letter-spacing: 0.01em; padding: 0.55rem 0.9rem; }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] { color: var(--tsa-accent); }
+h2, h3 { letter-spacing: -0.01em; }
+[data-testid="stBadge"], .stBadge { font-weight: 600; letter-spacing: 0.02em; }
+
+/* Primary action button (OSINT pipeline). */
+.st-key-osint_run button { font-weight: 700; letter-spacing: 0.02em; min-height: 2.9rem; }
+
+/* Sidebar: grouped cards with subdued section labels. */
+[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] { background: rgba(255,255,255,0.02); }
+[data-testid="stSidebar"] h3 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--tsa-muted); margin-bottom: 0.2rem; }
+
+/* Inline wave accents for captions. */
+.tsa-fast { color: var(--tsa-fast); font-weight: 700; }
+.tsa-slow { color: var(--tsa-slow); font-weight: 700; }
+</style>
+"""
+
+
+def inject_tactical_css() -> None:
+    """Inject the presentation layer once per run (idempotent per rerun)."""
+    st.html(TACTICAL_CSS)
+
+
+def render_system_indicators(outcome: LoadOutcome, visible: pd.DataFrame, active: pd.DataFrame,
+                             cutoff: pd.Timestamp) -> None:
+    """Top-of-page indicator strip: slice size, activity, velocity, sources.
+
+    Always rendered, including for an empty slice (values read ``0``), so the
+    operator never loses the system picture when moving ``T``.
+
+    Args:
+        outcome: Load outcome for the current ``T``.
+        visible: Filtered, cutoff-safe alarm frame (may be empty).
+        active: Alarms active at ``T`` (may be empty).
+        cutoff: Observation instant ``T``.
+    """
+    settings = get_settings()
+    current, previous = cascade_velocity(visible, cutoff)
+    fast_share = float((visible["wave_class"] == ThreatWave.FAST.value).mean()) if len(visible) else 0.0
+    card: dict[str, Any] = {"border": True, "height": "stretch"}
+    with st.container(horizontal=True, key="kpi_strip", gap="small"):
+        st.metric("Alarms before T", f"{len(visible):,}", **card,
+                  delta=f"{outcome.withheld_rows:,} withheld ≥ T", delta_arrow="off",
+                  help="Rows with start_time strictly before T after threat filters. The delta is the "
+                       "number of future rows the temporal safeguard removed.")
+        st.metric("Active at T", f"{len(active):,}", **card,
+                  delta=f"{active['region'].nunique()} regions" if len(active) else "no live alarms",
+                  delta_arrow="off",
+                  help=f"Open-ended alarms that started within the last {ACTIVE_WINDOW_HOURS:.0f} h "
+                       "before T. These are the default cascade triggers.")
+        st.metric("Cascade velocity", f"{current:.1f} /h", **card,
+                  delta=f"{current - previous:+.1f} vs prior 6 h",
+                  chart_data=hourly_onsets(visible, cutoff) if len(visible) else None, chart_type="bar",
+                  help="Alarm onsets per hour in the 6 h before T; the sparkline shows the last 24 h.")
+        st.metric("Fast-wave share", f"{fast_share:.0%}", **card,
+                  delta=f"{1 - fast_share:.0%} slow-wave" if len(visible) else "n/a", delta_arrow="off",
+                  help="Ballistic / cruise / aviation / bombs / artillery as a share of visible alarms.")
+        st.metric("Data source", "Synthetic" if outcome.source_used == SOURCE_SYNTHETIC else "CSV", **card,
+                  delta="fallback engaged" if outcome.fallback_reason else "as configured",
+                  delta_arrow="off",
+                  help="Synthetic data is used automatically when the alarm CSV is missing.")
+        st.metric("OSINT engine", "Gemini" if settings.llm_enabled else "Offline", **card,
+                  delta=settings.gemini_model if settings.llm_enabled else "rule-based parser",
+                  delta_arrow="off",
+                  help="Telegram OSINT parsing engine. Set GEMINI_API_KEY in .env to enable Gemini.")
+
+
+# --------------------------------------------------------------------------- #
 # 5. Page composition
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -2007,36 +2129,46 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    st.title("Air-threat cascade engine", icon=":material/radar:")
-    st.caption(
-        "Evaluation console · every view is computed from alarms that started strictly before the "
-        "cutoff T · all times UTC"
-    )
+    inject_tactical_css()
+    with st.container(key="hero"):
+        st.title("Air-threat cascade engine", icon=":material/radar:")
+        st.caption(
+            "Multimodal spatiotemporal cascade & LLM intelligence · every view is computed from "
+            "alarms that started strictly before the cutoff **T** · all times UTC"
+        )
 
     with st.sidebar:
-        st.header("Controls", icon=":material/tune:")
-        selection = render_source_controls()
+        st.header("Mission controls", icon=":material/tune:")
+        st.caption("Set the data slice, the observation instant T and the model. Everything "
+                   "on the page recomputes live.")
+        with st.container(border=True, key="sb_source"):
+            selection = render_source_controls()
         source_used, fallback_reason = resolve_source(selection.source, selection.csv_path)
         try:
-            history = load_history(source_used, selection.csv_path, selection.num_records,
-                                   selection.seed, selection.start_date)
+            with st.spinner("Loading alarm history…"):
+                history = load_history(source_used, selection.csv_path, selection.num_records,
+                                       selection.seed, selection.start_date)
         except (SchemaValidationError, FileNotFoundError, ValueError) as exc:
             st.error(f"Could not load alarm data: {exc}", icon=":material/error:")
             st.stop()
         signature = "|".join([source_used, selection.csv_path, str(selection.num_records),
                               str(selection.seed), selection.start_date, str(len(history))])
-        cutoff = render_cutoff_controls(history, signature)
-        waves, threat_types = render_threat_filters(history)
-        params = render_cascade_controls()
+        with st.container(border=True, key="sb_cutoff"):
+            cutoff = render_cutoff_controls(history, signature)
+        with st.container(border=True, key="sb_filters"):
+            waves, threat_types = render_threat_filters(history)
+            params = render_cascade_controls()
 
     try:
-        outcome = load_data(selection, cutoff, history, source_used, fallback_reason)
+        with st.spinner("Applying temporal safeguard…"):
+            outcome = load_data(selection, cutoff, history, source_used, fallback_reason)
     except (SchemaValidationError, TemporalLeakageError, FileNotFoundError, ValueError) as exc:
         st.error(f"Temporal safeguard failed: {exc}", icon=":material/gpp_bad:")
         st.stop()
 
     visible = apply_threat_filters(outcome.frame, waves, threat_types)
     active = active_alarms(visible, cutoff)
+    render_system_indicators(outcome, visible, active, cutoff)
     render_status_banner(outcome, cutoff, history, len(visible))
 
     tab_overview, tab_map, tab_sim, tab_method = st.tabs(
