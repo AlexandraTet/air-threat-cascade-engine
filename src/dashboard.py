@@ -56,11 +56,18 @@ import networkx as nx  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
-from matplotlib.figure import Figure  # noqa: E402
-from matplotlib.lines import Line2D  # noqa: E402
 
 from src.config import get_settings  # noqa: E402
 from src.llm_parser import GeminiOSINTParser, demo_messages  # noqa: E402
+from src.visualizer import (  # noqa: E402,F401 - layout_positions/short_region_name are re-exported
+    REGION_CENTROIDS as REGION_COORDS,
+    WAVE_COLORS,
+    layout_positions,
+    load_base_map,
+    render_graph_figure,
+    render_wave_map_figure,
+    short_region_name,
+)
 from src.loader import (  # noqa: E402
     THREAT_TYPES,
     UKRAINIAN_REGIONS,
@@ -96,41 +103,8 @@ WAVE_LABELS: Final[Mapping[str, str]] = {
     ThreatWave.SLOW.value: "Slow-wave (UAV / Shahed)",
     ThreatWave.UNKNOWN.value: "Unclassified",
 }
-WAVE_COLORS: Final[Mapping[str, str]] = {
-    ThreatWave.FAST.value: "#D1495B",
-    ThreatWave.SLOW.value: "#2E86AB",
-    ThreatWave.UNKNOWN.value: "#8D99AE",
-}
-
-# Approximate oblast-centre coordinates (longitude, latitude) used as a fixed
-# geographic layout for the propagation graph, so it reads like a map.
-REGION_COORDS: Final[Mapping[str, tuple[float, float]]] = {
-    "Kyiv City": (30.52, 50.45),
-    "Kyiv Oblast": (29.95, 49.95),
-    "Kharkiv Oblast": (36.23, 49.99),
-    "Odesa Oblast": (30.73, 46.48),
-    "Dnipropetrovsk Oblast": (35.05, 48.46),
-    "Zaporizhzhia Oblast": (35.14, 47.84),
-    "Mykolaiv Oblast": (32.00, 46.97),
-    "Kherson Oblast": (32.62, 46.64),
-    "Sumy Oblast": (34.80, 50.91),
-    "Chernihiv Oblast": (31.29, 51.49),
-    "Poltava Oblast": (34.55, 49.59),
-    "Cherkasy Oblast": (32.06, 49.44),
-    "Kirovohrad Oblast": (32.26, 48.51),
-    "Vinnytsia Oblast": (28.47, 49.23),
-    "Zhytomyr Oblast": (28.66, 50.25),
-    "Khmelnytskyi Oblast": (26.98, 49.42),
-    "Rivne Oblast": (26.25, 50.62),
-    "Volyn Oblast": (25.33, 50.75),
-    "Lviv Oblast": (24.03, 49.84),
-    "Ternopil Oblast": (25.59, 49.55),
-    "Ivano-Frankivsk Oblast": (24.71, 48.92),
-    "Chernivtsi Oblast": (25.94, 48.29),
-    "Zakarpattia Oblast": (22.30, 48.62),
-    "Donetsk Oblast": (37.80, 48.00),
-    "Luhansk Oblast": (39.30, 48.57),
-}
+# Wave colours (``WAVE_COLORS``) and oblast centroids (``REGION_COORDS``) are
+# owned by ``src.visualizer`` and imported above so charts and the map agree.
 
 PREDICTION_COLUMNS: Final[Sequence[str]] = (
     "region",
@@ -665,139 +639,10 @@ def predict_cascade(
 
 
 # --------------------------------------------------------------------------- #
-# 3b. Graph rendering (matplotlib)
+# 3b. Graph rendering lives in ``src.visualizer`` (map underlay, high-contrast
+#     labels). ``render_graph_figure`` / ``render_wave_map_figure`` /
+#     ``layout_positions`` / ``short_region_name`` are re-exported above.
 # --------------------------------------------------------------------------- #
-def short_region_name(region: str) -> str:
-    """Compact label for graph nodes (``"Kyiv Oblast"`` -> ``"Kyiv reg."``)."""
-    if region == "Kyiv City":
-        return "Kyiv"
-    if region == "Kyiv Oblast":
-        return "Kyiv reg."
-    return region.replace(" Oblast", "")
-
-
-def layout_positions(graph: nx.Graph) -> dict[str, tuple[float, float]]:
-    """Geographic layout with a spring-layout fallback for unknown regions.
-
-    Args:
-        graph: Any graph whose nodes are region names.
-
-    Returns:
-        Mapping of node to ``(x, y)``.
-    """
-    known = {n: REGION_COORDS[n] for n in graph.nodes if n in REGION_COORDS}
-    if len(known) == graph.number_of_nodes():
-        return known
-    if known:
-        return nx.spring_layout(graph, pos=known, fixed=list(known), seed=42)
-    return nx.spring_layout(graph, seed=42)
-
-
-def render_graph_figure(
-    graph: nx.DiGraph,
-    *,
-    highlight: Optional[Mapping[str, tuple[str, float]]] = None,
-    min_weight: int = 1,
-    max_edges: int = 80,
-    show_labels: bool = True,
-    title: str = "",
-    dark: bool = False,
-) -> Figure:
-    """Draw the propagation graph on a geographic layout.
-
-    Args:
-        graph: Propagation graph.
-        highlight: Optional ``region -> (color, alpha)`` overrides for nodes
-            (used to mark triggers and predicted targets).
-        min_weight: Hide edges observed fewer times than this.
-        max_edges: Keep only the strongest ``max_edges`` edges.
-        show_labels: Draw region labels.
-        title: Figure title.
-        dark: Use light text for dark app themes.
-
-    Returns:
-        A matplotlib :class:`~matplotlib.figure.Figure` with a transparent
-        background. The caller owns the figure and should close it.
-    """
-    text_color = "#E6E6E6" if dark else "#222222"
-    fig, ax = plt.subplots(figsize=(10.5, 6.6))
-    fig.patch.set_alpha(0.0)
-    ax.set_facecolor("none")
-    ax.set_axis_off()
-    if title:
-        ax.set_title(title, color=text_color, fontsize=12, loc="left")
-
-    if graph.number_of_nodes() == 0:
-        ax.text(0.5, 0.5, "No alarms before T", ha="center", va="center", color=text_color)
-        return fig
-
-    pos = layout_positions(graph)
-    nodes = list(graph.nodes)
-    alarms = np.asarray([graph.nodes[n].get("alarms", 1) for n in nodes], dtype=float)
-    sizes = 140 + 900 * (alarms / alarms.max() if alarms.max() > 0 else alarms)
-    highlight = highlight or {}
-    colors = [highlight.get(n, ("#9AA5B1", 0.9))[0] for n in nodes]
-    alphas = [highlight.get(n, ("#9AA5B1", 0.9))[1] for n in nodes]
-
-    edges = sorted(
-        (e for e in graph.edges(data=True) if e[2]["weight"] >= min_weight),
-        key=lambda e: e[2]["weight"],
-        reverse=True,
-    )[:max_edges]
-    if edges:
-        weights = np.asarray([e[2]["weight"] for e in edges], dtype=float)
-        widths = 0.6 + 4.0 * weights / weights.max()
-        nx.draw_networkx_edges(
-            graph,
-            pos,
-            edgelist=[(u, v) for u, v, _ in edges],
-            width=list(widths),
-            edge_color="#6C7A89",
-            alpha=0.45,
-            arrows=True,
-            arrowstyle="-|>",
-            arrowsize=11,
-            connectionstyle="arc3,rad=0.15",
-            node_size=list(sizes),
-            ax=ax,
-        )
-    nx.draw_networkx_nodes(
-        graph,
-        pos,
-        nodelist=nodes,
-        node_size=list(sizes),
-        node_color=colors,
-        alpha=alphas,
-        linewidths=0.8,
-        edgecolors=text_color,
-        ax=ax,
-    )
-    if show_labels:
-        nx.draw_networkx_labels(
-            graph,
-            pos,
-            labels={n: short_region_name(n) for n in nodes},
-            font_size=8,
-            font_color=text_color,
-            ax=ax,
-        )
-    ax.margins(0.08)
-
-    legend_items = [
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#9AA5B1", markersize=9,
-               label="Region (size = alarms before T)"),
-        Line2D([0], [0], color="#6C7A89", lw=3, alpha=0.6, label="Propagation edge (width = count)"),
-    ]
-    legend_colors = {c for c, _ in highlight.values()}
-    if "#D1495B" in legend_colors:
-        legend_items.append(Line2D([0], [0], marker="o", color="none", markerfacecolor="#D1495B",
-                                   markersize=9, label="Active trigger at T"))
-    if "#F2A541" in legend_colors:
-        legend_items.append(Line2D([0], [0], marker="o", color="none", markerfacecolor="#F2A541",
-                                   markersize=9, label="Predicted next target"))
-    ax.legend(handles=legend_items, loc="lower left", fontsize=8, frameon=False,
-              labelcolor=text_color)
-    return fig
 
 
 # --------------------------------------------------------------------------- #
@@ -961,164 +806,6 @@ def node_activity(df: pd.DataFrame, cutoff: pd.Timestamp, *,
     return frame["region"].value_counts().rename("alarms")
 
 
-def render_wave_map_figure(
-    graphs: Mapping[str, nx.DiGraph],
-    *,
-    layers: Sequence[str],
-    activity: pd.Series,
-    active_regions: Sequence[str] = (),
-    trigger: Optional[str] = None,
-    predictions: Optional[pd.DataFrame] = None,
-    min_probability: float = 0.0,
-    max_edges_per_layer: int = 60,
-    show_edge_labels: bool = True,
-    max_labels: int = 18,
-    show_node_labels: bool = True,
-    title: str = "",
-    dark: bool = False,
-) -> Figure:
-    """Draw fast- and slow-wave propagation layers on one geographic map.
-
-    Nodes are oblasts sized by ``activity`` (alarm frequency before ``T``).
-    Each layer draws its strongest edges in the wave colour, width scaled by
-    transition probability and opacity by observation count; prior-topology
-    edges are dashed. Edge labels show ``probability · lag``. Regions active
-    at ``T`` are filled red, the selected trigger gets a star, and predicted
-    targets are orange with their arrival estimate annotated.
-
-    Args:
-        graphs: Per-wave graphs from :func:`build_wave_graphs`.
-        layers: Wave classes to draw (``"fast"``, ``"slow"``).
-        activity: Region -> alarm count used for node sizing.
-        active_regions: Regions with an alarm active at ``T``.
-        trigger: Region selected as the simulation trigger.
-        predictions: Output of :func:`predict_cascade` for the trigger.
-        min_probability: Hide edges below this transition probability.
-        max_edges_per_layer: Strongest edges kept per layer.
-        show_edge_labels: Annotate the strongest edges.
-        max_labels: Cap on annotated edges across layers.
-        show_node_labels: Draw region names.
-        title: Figure title.
-        dark: Use light text for dark app themes.
-
-    Returns:
-        A transparent-background matplotlib figure owned by the caller.
-    """
-    text_color = "#E6E6E6" if dark else "#222222"
-    fig, ax = plt.subplots(figsize=(11, 7))
-    fig.patch.set_alpha(0.0)
-    ax.set_facecolor("none")
-    ax.set_axis_off()
-    if title:
-        ax.set_title(title, color=text_color, fontsize=12, loc="left")
-
-    union = nx.DiGraph()
-    for graph in graphs.values():
-        union.add_nodes_from(graph.nodes)
-    for region in UKRAINIAN_REGIONS:
-        union.add_node(region)
-    pos = layout_positions(union)
-    nodes = list(union.nodes)
-
-    counts = np.asarray([float(activity.get(n, 0.0)) if len(activity) else 0.0 for n in nodes])
-    peak = counts.max() if counts.size and counts.max() > 0 else 1.0
-    sizes = 110 + 1100 * (counts / peak)
-
-    predicted: dict[str, tuple[float, float]] = {}
-    if predictions is not None and not predictions.empty:
-        predicted = {str(r.region): (float(r.probability), float(r.eta_min))
-                     for r in predictions.itertuples(index=False)}
-    active_set = set(active_regions)
-    fill, alpha = [], []
-    for node in nodes:
-        if node == trigger:
-            fill.append("#FFD166"); alpha.append(1.0)
-        elif node in predicted:
-            fill.append("#F2A541"); alpha.append(0.45 + 0.55 * predicted[node][0])
-        elif node in active_set:
-            fill.append("#D1495B"); alpha.append(0.95)
-        else:
-            fill.append("#B8C2CC"); alpha.append(0.85)
-
-    label_budget = max_labels
-    for wave in layers:
-        graph = graphs.get(wave)
-        if graph is None or graph.number_of_edges() == 0:
-            continue
-        edges = sorted(
-            (e for e in graph.edges(data=True) if e[2].get("probability", 0.0) >= min_probability),
-            key=lambda e: (e[2].get("weight", 1), e[2].get("probability", 0.0)),
-            reverse=True,
-        )[:max_edges_per_layer]
-        if not edges:
-            continue
-        weights = np.asarray([e[2].get("weight", 1) for e in edges], dtype=float)
-        probs = np.asarray([e[2].get("probability", 0.0) for e in edges], dtype=float)
-        prior = graph.graph.get("source") == "prior"
-        style = "dashed" if prior else "solid"
-        rad = 0.08 if wave == "fast" else 0.22
-        nx.draw_networkx_edges(
-            graph, pos, edgelist=[(u, v) for u, v, _ in edges],
-            width=list(0.6 + 3.4 * probs),
-            alpha=0.25 if prior else None,
-            edge_color=[(*matplotlib.colors.to_rgb(WAVE_COLORS[wave]),
-                         0.3 + 0.6 * w / weights.max()) for w in weights] if not prior else WAVE_COLORS[wave],
-            style=style, arrows=True, arrowstyle="-|>", arrowsize=10,
-            connectionstyle=f"arc3,rad={rad}", node_size=list(sizes), ax=ax,
-        )
-        if show_edge_labels and label_budget > 0:
-            labelled = edges[:label_budget]
-            label_budget -= len(labelled)
-            nx.draw_networkx_edge_labels(
-                graph, pos,
-                edge_labels={(u, v): f"{d['probability']:.0%}·{d['median_lag_min']:.0f}m"
-                             for u, v, d in labelled},
-                font_size=6.5, font_color=WAVE_COLORS[wave], label_pos=0.5,
-                bbox={"alpha": 0.0}, connectionstyle=f"arc3,rad={rad}", ax=ax,
-            )
-
-    if trigger and predicted:
-        route_graph = nx.DiGraph()
-        route_graph.add_edges_from((trigger, target) for target in predicted if trigger in pos)
-        nx.draw_networkx_edges(
-            route_graph, pos, width=[1.5 + 3.0 * predicted[v][0] for _, v in route_graph.edges],
-            edge_color="#F2A541", alpha=0.9, arrows=True, arrowstyle="-|>", arrowsize=14,
-            connectionstyle="arc3,rad=0.12", node_size=list(sizes), ax=ax,
-        )
-        for target, (_, eta) in predicted.items():
-            if target in pos:
-                x, y = pos[target]
-                ax.annotate(f"+{eta:.0f} min", (x, y), xytext=(0, 11), textcoords="offset points",
-                            ha="center", fontsize=7.5, color="#B86B00", fontweight="bold")
-
-    nx.draw_networkx_nodes(union, pos, nodelist=nodes, node_size=list(sizes), node_color=fill,
-                           alpha=alpha, linewidths=0.8, edgecolors=text_color, ax=ax)
-    if trigger and trigger in pos:
-        ax.scatter([pos[trigger][0]], [pos[trigger][1]], marker="*", s=420, color="#FFD166",
-                   edgecolors="#8A5A00", linewidths=0.9, zorder=5)
-    if show_node_labels:
-        nx.draw_networkx_labels(union, pos, labels={n: short_region_name(n) for n in nodes},
-                                font_size=7.5, font_color=text_color, ax=ax)
-    ax.margins(0.08)
-
-    handles = [
-        Line2D([0], [0], color=WAVE_COLORS["fast"], lw=3, label="Fast-wave edge (prob · lag)"),
-        Line2D([0], [0], color=WAVE_COLORS["slow"], lw=3, label="Slow-wave edge (prob · lag)"),
-        Line2D([0], [0], color="#777777", lw=2, linestyle="dashed", label="Prior topology (no data)"),
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#B8C2CC", markersize=9,
-               label="Region (size = alarm frequency before T)"),
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#D1495B", markersize=9,
-               label="Active at T"),
-        Line2D([0], [0], marker="*", color="none", markerfacecolor="#FFD166", markersize=13,
-               label="Selected trigger"),
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#F2A541", markersize=9,
-               label="Predicted target (+ETA)"),
-    ]
-    ax.legend(handles=handles, loc="lower left", fontsize=7.5, frameon=False, labelcolor=text_color,
-              ncol=2)
-    return fig
-
-
 def layer_summary(graphs: Mapping[str, nx.DiGraph]) -> pd.DataFrame:
     """One row per wave layer: node/edge counts, mean probability, median lag, source."""
     rows = []
@@ -1138,7 +825,19 @@ def layer_summary(graphs: Mapping[str, nx.DiGraph]) -> pd.DataFrame:
 
 
 def _theme_is_dark() -> bool:
-    """Best-effort detection of the active Streamlit theme."""
+    """Decide whether figures should use the dark palette.
+
+    An explicit ``theme.base`` in ``.streamlit/config.toml`` is authoritative:
+    it is what the page actually renders with. Only when no base is pinned do
+    we fall back to ``st.context.theme.type``, which can echo the browser's
+    OS preference ("System") rather than the rendered theme.
+    """
+    try:
+        base = st.get_option("theme.base")
+    except Exception:  # pragma: no cover - defensive; option lookup should not fail
+        base = None
+    if base in ("light", "dark"):
+        return base == "dark"
     try:
         return getattr(st.context.theme, "type", "light") == "dark"
     except Exception:  # pragma: no cover - defensive; theme API may be absent
@@ -1591,6 +1290,8 @@ def render_wave_map_tab(
     with st.container(horizontal=True, gap="medium"):
         edge_labels = st.toggle("Edge labels (prob · lag)", value=True, key="wm_edge_labels")
         node_labels = st.toggle("Region labels", value=True, key="wm_node_labels")
+        map_underlay = st.toggle("Map underlay", value=True, key="wm_map_underlay",
+                                 help="Draw Ukraine's outline / oblast boundaries beneath the graph.")
 
     layers = list(chosen_layers) if isinstance(chosen_layers, list) else []
     activity = node_activity(visible, cutoff, window_hours=_ACTIVITY_WINDOWS.get(str(window_label), 24.0))
@@ -1631,15 +1332,17 @@ def render_wave_map_tab(
             st.badge("observed graph" if graph.graph.get("source") == "observed" else "prior topology",
                      icon=":material/hub:", color="green" if graph.graph.get("source") == "observed" else "violet")
 
+    base_map = load_base_map()
     fig = render_wave_map_figure(
         graphs, layers=layers, activity=activity, active_regions=list(active["region"].unique()),
         trigger=trigger, predictions=predictions, min_probability=float(min_probability),
         max_edges_per_layer=int(max_edges), show_edge_labels=bool(edge_labels),
-        show_node_labels=bool(node_labels),
+        show_node_labels=bool(node_labels), show_map=bool(map_underlay), base_map=base_map,
         title=f"Wave map at T = {cutoff:%Y-%m-%d %H:%M} UTC", dark=_theme_is_dark(),
     )
     st.pyplot(fig)
     plt.close(fig)
+    st.caption(f"Base map: {base_map.description}.")
 
     col_pred, col_layers = st.columns((3, 2))
     with col_pred, st.container(border=True):

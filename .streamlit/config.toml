@@ -1,4 +1,7 @@
 [theme]
+# Pinned so the page and st.context.theme agree; the map renderer picks its
+# light/dark palette from the detected theme.
+base = "light"
 primaryColor = "#2E86AB"
 headingFont = "Inter, sans-serif"
 baseRadius = "medium"
