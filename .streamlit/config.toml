@@ -1,0 +1,15 @@
+[theme]
+primaryColor = "#2E86AB"
+headingFont = "Inter, sans-serif"
+baseRadius = "medium"
+
+[server]
+headless = true
+runOnSave = true
+
+[runner]
+# Bare expressions in the script must never leak onto the page.
+magicEnabled = false
+
+[browser]
+gatherUsageStats = false
