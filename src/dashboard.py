@@ -597,7 +597,10 @@ def predict_cascade(
 
     Args:
         graph: Propagation graph built from cutoff-filtered data.
-        triggers: ``(region, elapsed_minutes)`` pairs active at ``T``.
+        triggers: ``(region, elapsed_minutes)`` pairs active at ``T``, or
+            ``(region, elapsed_minutes, weight)`` triples where ``weight`` in
+            ``[0, 1]`` scales the trigger's contributions (used for the
+            confidence of OSINT-derived triggers).
         cutoff: Observation instant ``T``.
         top_k: Number of rows to return.
         hops: Propagation depth, ``1`` or ``2``.
@@ -606,7 +609,7 @@ def predict_cascade(
     Returns:
         Frame with :data:`PREDICTION_COLUMNS`, best candidates first.
     """
-    trigger_regions = {region for region, _ in triggers}
+    trigger_regions = {str(item[0]) for item in triggers}
     paths: dict[str, list[tuple[float, float, str, int]]] = {}
 
     def successors(region: str) -> list[tuple[str, float, float]]:
@@ -615,14 +618,16 @@ def predict_cascade(
             for succ, data in graph[region].items()
         ]
 
-    for region, elapsed in triggers:
-        if region not in graph:
+    for item in triggers:
+        region, elapsed = str(item[0]), float(item[1])
+        weight = min(1.0, max(0.0, float(item[2]))) if len(item) > 2 else 1.0
+        if region not in graph or weight <= 0.0:
             continue
         for succ, p1, lag1 in successors(region):
             if succ in trigger_regions:
                 continue
             overdue = max(0.0, elapsed - lag1)
-            p = p1 * math.exp(-overdue / max(decay_min, 1e-9))
+            p = weight * p1 * math.exp(-overdue / max(decay_min, 1e-9))
             eta = max(0.0, lag1 - elapsed)
             paths.setdefault(succ, []).append((p, eta, region, 1))
             if hops < 2:
@@ -1699,58 +1704,241 @@ def render_wave_map_tab(
                                             "in": st.column_config.NumberColumn("In", format="%d")})
 
 
-def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Timestamp,
-                         params: CascadeParams, all_regions: Sequence[str]) -> None:
-    """Tab 3: cascade simulator with top-K targets and arrival estimates.
+_TRIGGER_MODES: Final[Mapping[str, str]] = {
+    "observed": "Observed alarms at T",
+    "whatif": "What-if regions",
+    "osint": "OSINT message",
+}
+
+
+@st.cache_resource(show_spinner=False)
+def get_osint_parser() -> GeminiOSINTParser:
+    """Process-wide OSINT parser (keeps the Gemini client and circuit breaker).
+
+    Returns:
+        A :class:`GeminiOSINTParser` built from the current settings; it is
+        offline automatically when no API key is configured.
+    """
+    return GeminiOSINTParser()
+
+
+def _run_osint_pipeline() -> None:
+    """Button callback: parse the pasted message and switch the simulator to it.
+
+    Runs before the script reruns, so it may update the trigger-mode widget's
+    session state. Never raises: parser failures degrade to rules, and any
+    unexpected error is stored for display.
+    """
+    text = str(st.session_state.get("osint_text", "")).strip()
+    st.session_state["osint_error"] = None
+    if not text:
+        st.session_state["osint_result"] = None
+        st.session_state["osint_error"] = "Paste a monitoring message first."
+        return
+    try:
+        parser = get_osint_parser()
+        record = parser.parse(text)
+        st.session_state["osint_result"] = record.model_dump(mode="json")
+        st.session_state["osint_status"] = parser.status()
+        st.session_state["sim_trigger_mode"] = "osint"
+    except Exception as exc:  # noqa: BLE001 - UI must never crash on parser issues
+        logger.exception("OSINT pipeline failed")
+        st.session_state["osint_result"] = None
+        st.session_state["osint_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _load_osint_example() -> None:
+    """Button callback: copy the selected demo message into the text area."""
+    st.session_state["osint_text"] = st.session_state.get("osint_example", demo_messages()[0])
+
+
+def osint_triggers(record: Mapping[str, Any], *, include_source: bool = True) -> pd.DataFrame:
+    """Turn a parsed OSINT record into simulator triggers active at ``T``.
+
+    Projected ``target_regions`` become triggers (the message says they are
+    being, or about to be, alarmed). The ``source_region`` is added when it is
+    a Ukrainian oblast, since the threat is currently there. External origins
+    (Belgorod, Black Sea, ...) are not nodes and are skipped. Every trigger
+    starts at ``T`` (elapsed 0) and is weighted by the record's confidence.
 
     Args:
-        graph: Propagation graph from the visible data.
+        record: ``ParsedThreat.model_dump()`` payload.
+        include_source: Add the source oblast as a trigger.
+
+    Returns:
+        Columns ``region``, ``elapsed_min``, ``weight``, ``role``.
+    """
+    confidence = float(record.get("confidence_score", 0.0) or 0.0)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    source = record.get("source_region")
+    if include_source and source in UKRAINIAN_REGIONS:
+        rows.append({"region": source, "elapsed_min": 0.0, "weight": confidence, "role": "source"})
+        seen.add(str(source))
+    for target in record.get("target_regions") or []:
+        if target in UKRAINIAN_REGIONS and target not in seen:
+            rows.append({"region": target, "elapsed_min": 0.0, "weight": confidence, "role": "target"})
+            seen.add(str(target))
+    return pd.DataFrame(rows, columns=["region", "elapsed_min", "weight", "role"])
+
+
+def render_osint_input() -> Optional[dict[str, Any]]:
+    """Simulator block: paste a Telegram message, parse it, inspect the record.
+
+    Returns:
+        The parsed record payload stored in session state, or ``None``.
+    """
+    with st.container(border=True):
+        st.subheader("Multimodal OSINT input", icon=":material/translate:")
+        st.caption(
+            "Paste a raw monitoring-channel update (Ukrainian / Russian / English slang is fine). "
+            "Gemini normalises it into threat type, source and target oblasts with a confidence "
+            "score; without an API key the rule-based parser runs instead. Parsed regions become "
+            "triggers active at T."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            st.selectbox("Example message", demo_messages(), key="osint_example",
+                         format_func=lambda m: m[:70] + ("…" if len(m) > 70 else ""))
+            st.button("Use example", icon=":material/content_paste:", on_click=_load_osint_example,
+                      key="osint_use_example")
+        st.text_area(
+            "Raw monitoring message", key="osint_text", height=110,
+            placeholder="⚠️ Сумщина: 6 мопедів курсом на Полтавщину, швидкість ~150 км/год",
+        )
+        st.button("⚡ Parse OSINT & Run Cascade Simulation", type="primary", key="osint_run",
+                  on_click=_run_osint_pipeline, width="stretch")
+
+        error = st.session_state.get("osint_error")
+        if error:
+            st.warning(error, icon=":material/warning:")
+        record = st.session_state.get("osint_result")
+        status = st.session_state.get("osint_status") or {}
+        if record:
+            engine = str(record.get("parser", "rules"))
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                st.badge(str(record.get("threat_type", "unknown")).replace("_", " "),
+                         icon=":material/warning:", color="red" if record.get("wave_class") == "fast"
+                         else "blue" if record.get("wave_class") == "slow" else "gray")
+                st.badge(f"{record.get('wave_class', 'unknown')}-wave", icon=":material/speed:",
+                         color="gray")
+                st.badge(f"source: {record.get('source_region') or '—'}", icon=":material/flight_takeoff:",
+                         color="orange")
+                st.badge(f"targets: {', '.join(record.get('target_regions') or []) or '—'}",
+                         icon=":material/my_location:", color="violet")
+                st.badge(f"confidence {float(record.get('confidence_score', 0)):.0%}",
+                         icon=":material/percent:", color="green")
+                st.badge({"gemini": "Gemini", "rules": "rule-based fallback",
+                          "synthetic": "synthetic scenario"}.get(engine, engine),
+                         icon=":material/smart_toy:" if engine == "gemini" else ":material/rule:",
+                         color="green" if engine == "gemini" else "orange")
+            st.caption(record.get("raw_summary", ""))
+            if record.get("unmapped_regions"):
+                st.caption("Unmapped mentions: " + ", ".join(record["unmapped_regions"]))
+            if status.get("offline_reason"):
+                st.caption(f"Parser offline: {status['offline_reason']}")
+            with st.expander("Parsed OSINT record (structured JSON)", icon=":material/data_object:",
+                             expanded=True):
+                st.json(record, expanded=2)
+        return record if isinstance(record, dict) else None
+
+
+def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Timestamp,
+                         params: CascadeParams, all_regions: Sequence[str],
+                         wave_graphs: Optional[Mapping[str, nx.DiGraph]] = None) -> None:
+    """Tab 3: cascade simulator with OSINT ingestion, top-K targets and ETAs.
+
+    Trigger sources: alarms observed active at ``T``, hand-picked what-if
+    regions, or a parsed OSINT message whose source / target oblasts are
+    injected as triggers at ``T`` weighted by the parser's confidence.
+
+    Args:
+        graph: Mixed-wave propagation graph from the visible data.
         active: Alarms active at ``T`` (default triggers).
         cutoff: Observation instant ``T``.
         params: Cascade parameters from the sidebar.
         all_regions: Regions offered for manual what-if triggers.
+        wave_graphs: Optional per-wave graphs; when an OSINT record has a known
+            wave class its layer is used so the propagation view matches it.
     """
     st.caption(
-        "Triggers are the alarms active at T. Each successor's chance is the empirical "
-        "P(target | trigger) discounted once the typical lag has elapsed; multiple triggers combine "
-        "with a noisy-OR. Arrival estimates are median historical lags measured from each trigger's start."
+        "Each successor's chance is the empirical P(target | trigger) discounted once the typical "
+        "lag has elapsed; multiple triggers combine with a noisy-OR. Arrival estimates are median "
+        "historical lags measured from each trigger's start."
     )
-    with st.container(horizontal=True, vertical_alignment="bottom"):
-        use_observed = st.toggle("Use observed active alarms at T", value=True, key="sim_use_observed")
-        top_k = st.slider("Top-K targets", 3, 15, 8, key="sim_top_k")
+    record = render_osint_input()
 
-    if use_observed:
+    # Session state drives the widget (no ``default``) so the parse-button
+    # callback may switch the mode to "osint" without a Streamlit warning.
+    st.session_state.setdefault("sim_trigger_mode", "observed")
+    with st.container(horizontal=True, vertical_alignment="bottom", gap="medium"):
+        mode = st.segmented_control(
+            "Trigger source", options=list(_TRIGGER_MODES), required=True,
+            format_func=_TRIGGER_MODES.get, key="sim_trigger_mode",
+        )
+        top_k = st.slider("Top-K targets", 3, 15, 8, key="sim_top_k")
+    mode = str(mode) if mode in _TRIGGER_MODES else "observed"
+
+    sim_graph = graph
+    graph_note = "mixed-wave graph"
+    if mode == "observed":
         triggers_df = (
             active.groupby("region", observed=True)["elapsed_min"].min().reset_index()
-            if not active.empty else pd.DataFrame(columns=["region", "elapsed_min"])
+            .assign(weight=1.0, role="active alarm")
+            if not active.empty else pd.DataFrame(columns=["region", "elapsed_min", "weight", "role"])
         )
-    else:
+        empty_hint = ("No alarms are active at T, so there is nothing to propagate. Move T to a busier "
+                      "moment, pick what-if regions, or parse an OSINT message.")
+    elif mode == "whatif":
         with st.container(horizontal=True, vertical_alignment="bottom"):
             chosen = st.multiselect("What-if trigger regions", options=list(all_regions),
                                     default=list(all_regions[:1]), key="sim_manual_regions")
             elapsed = st.slider("Minutes since triggers started", 0, 180, 0, step=5, key="sim_elapsed")
-        triggers_df = pd.DataFrame({"region": chosen, "elapsed_min": float(elapsed)})
+        triggers_df = pd.DataFrame({"region": chosen, "elapsed_min": float(elapsed), "weight": 1.0,
+                                    "role": "what-if"})
+        empty_hint = "Pick at least one what-if region."
+    else:
+        if record is None:
+            st.info("Parse an OSINT message above to inject its regions as triggers at T.",
+                    icon=":material/translate:")
+            return
+        include_source = st.toggle("Include the source oblast as a trigger", value=True,
+                                   key="osint_include_source")
+        triggers_df = osint_triggers(record, include_source=include_source)
+        wave = str(record.get("wave_class", "unknown"))
+        if wave_graphs and wave in wave_graphs:
+            sim_graph = wave_graphs[wave]
+            graph_note = (f"{wave}-wave layer · "
+                          f"{'observed' if sim_graph.graph.get('source') == 'observed' else 'prior topology'}")
+        empty_hint = ("The message names no Ukrainian oblast (nationwide or external-origin threat), "
+                      "so there is no regional trigger to inject. Try what-if mode for a hypothesis.")
 
     if triggers_df.empty:
-        st.info("No alarms are active at T, so there is nothing to propagate. Move T to a busier moment "
-                "or switch off *Use observed active alarms* to run a what-if scenario.",
-                icon=":material/notifications_paused:")
+        st.info(empty_hint, icon=":material/notifications_paused:")
         return
 
-    triggers = [(str(r), float(e)) for r, e in triggers_df.itertuples(index=False)]
-    predictions = predict_cascade(graph, triggers, cutoff, top_k=top_k, hops=params.hops,
+    triggers = [(str(r.region), float(r.elapsed_min), float(r.weight))
+                for r in triggers_df.itertuples(index=False)]
+    predictions = predict_cascade(sim_graph, triggers, cutoff, top_k=top_k, hops=params.hops,
                                   decay_min=params.decay_min)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.badge(_TRIGGER_MODES[mode], icon=":material/input:", color="blue")
+        st.badge(f"{len(triggers)} trigger{'s' if len(triggers) != 1 else ''} at T",
+                 icon=":material/notifications_active:", color="red")
+        st.badge(graph_note, icon=":material/hub:", color="gray")
 
     col_trig, col_pred = st.columns((1, 2))
     with col_trig, st.container(border=True):
         st.subheader("Active triggers", icon=":material/notifications_active:")
         trig_view = triggers_df.sort_values("elapsed_min")
-        trig_view["in_graph"] = trig_view["region"].map(lambda r: r in graph)
+        trig_view["in_graph"] = trig_view["region"].map(lambda r: r in sim_graph)
         st.dataframe(
             trig_view, hide_index=True,
             column_config={
                 "region": "Region",
                 "elapsed_min": st.column_config.NumberColumn("Elapsed (min)", format="%.0f"),
+                "weight": st.column_config.ProgressColumn("Weight", min_value=0, max_value=1,
+                                                          format="percent"),
+                "role": "Role",
                 "in_graph": st.column_config.CheckboxColumn("Has history"),
             },
         )
@@ -1760,7 +1948,7 @@ def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Tim
     with col_pred, st.container(border=True):
         st.subheader(f"Top-{top_k} predicted next regions", icon=":material/trending_up:")
         if predictions.empty:
-            st.info("The active triggers have no outgoing propagation edges before T. Try a wider lag "
+            st.info("The triggers have no outgoing propagation edges before T. Try a wider lag "
                     "window, two hops, or a later T.", icon=":material/hub:")
         else:
             st.dataframe(
@@ -1778,12 +1966,13 @@ def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Tim
                 },
             )
 
-    highlight: dict[str, tuple[str, float]] = {r: ("#D1495B", 1.0) for r, _ in triggers}
+    highlight: dict[str, tuple[str, float]] = {r: ("#D1495B", 1.0) for r, _, _ in triggers}
     for row in predictions.itertuples(index=False):
         highlight[str(row.region)] = ("#F2A541", float(0.35 + 0.65 * row.probability))
     fig = render_graph_figure(
-        graph, highlight=highlight, min_weight=params.min_edge_weight, max_edges=60,
-        title="Simulated cascade at T", dark=_theme_is_dark(),
+        sim_graph, highlight=highlight,
+        min_weight=1 if sim_graph.graph.get("source") == "prior" else params.min_edge_weight,
+        max_edges=60, title=f"Simulated cascade at T · {_TRIGGER_MODES[mode]}", dark=_theme_is_dark(),
     )
     st.pyplot(fig)
     plt.close(fig)
@@ -2175,7 +2364,7 @@ def main() -> None:
     with tab_map:
         render_wave_map_tab(wave_graphs, visible, active, cutoff, params)
     with tab_sim:
-        render_simulator_tab(graph, active, cutoff, params, regions)
+        render_simulator_tab(graph, active, cutoff, params, regions, wave_graphs=wave_graphs)
     with tab_method:
         render_methodology_tab(outcome, cutoff, history, visible, wave_graphs, params)
 

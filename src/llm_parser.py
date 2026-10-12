@@ -792,8 +792,12 @@ def match_scenario(text: str) -> Optional[SyntheticScenario]:
     """Find the synthetic scenario matching ``text``, if any.
 
     A scenario matches when the message equals its canonical message
-    (ignoring punctuation / emoji / case) or contains every fingerprint
-    keyword.
+    (ignoring punctuation / emoji / case), or when it contains every
+    fingerprint keyword **and** says nothing the canned payload would lose:
+    every region the rule parser finds must belong to the scenario, and the
+    rule parser's threat type must agree. A pasted report that adds a second
+    threat or extra oblasts therefore goes to the rule-based parser instead
+    of being replaced by a demo payload.
 
     Args:
         text: Raw message.
@@ -808,8 +812,16 @@ def match_scenario(text: str) -> Optional[SyntheticScenario]:
     for scenario in SYNTHETIC_SCENARIOS:
         if normalised == _normalise_for_match(scenario.message.lower()):
             return scenario
+    rules = RuleBasedOSINTParser()
+    mentioned = {mention.name for mention in rules._find_regions(lowered)}
+    threat = rules._detect_threat(lowered)
     for scenario in SYNTHETIC_SCENARIOS:
-        if all(keyword in lowered for keyword in scenario.keywords):
+        if not all(keyword in lowered for keyword in scenario.keywords):
+            continue
+        allowed = set(scenario.payload.get("target_regions") or [])
+        if scenario.payload.get("source_region"):
+            allowed.add(str(scenario.payload["source_region"]))
+        if mentioned <= allowed and threat in (scenario.payload["threat_type"], "unknown"):
             return scenario
     return None
 

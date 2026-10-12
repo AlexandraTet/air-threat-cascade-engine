@@ -229,6 +229,19 @@ class ScenarioTests(unittest.TestCase):
         self.assertIsNone(match_scenario("Сумщина: 6 мопедів курсом на Полтавщину"))
         self.assertIsNone(match_scenario(""))
 
+    def test_richer_message_is_not_replaced_by_canned_payload(self) -> None:
+        # Contains the Belgorod→Kharkiv ballistic fingerprint but also a Shahed
+        # group towards Sumy and Poltava; a demo payload would discard that.
+        message = ("‼️ Пуски балістики з Бєлгорода на Харківщину, також група шахедів із Курська "
+                   "курсом на Сумщину та Полтавщину")
+        self.assertIsNone(match_scenario(message))
+        out = GeminiOSINTParser(settings=OFFLINE_SETTINGS).parse(message)
+        self.assertEqual(out.parser, "rules")
+        self.assertEqual(out.source_region, "Belgorod (RU)")
+        self.assertEqual(out.target_regions, ["Kharkiv Oblast", "Sumy Oblast", "Poltava Oblast"])
+        # Same fingerprint with a different threat type must not match either.
+        self.assertIsNone(match_scenario("Шахеди з Бєлгорода на Харків"))
+
     def test_rules_agree_with_scenario_types(self) -> None:
         rules = RuleBasedOSINTParser()
         for scenario in SYNTHETIC_SCENARIOS:

@@ -35,6 +35,7 @@ from src.dashboard import (
     layer_summary,
     node_activity,
     node_roles,
+    osint_triggers,
     predict_cascade,
     render_graph_figure,
     render_wave_map_figure,
@@ -200,6 +201,15 @@ class PredictionTests(unittest.TestCase):
         self.assertLessEqual(p2, 1.0)
         self.assertEqual(two.set_index("region").loc["C", "paths"], 2)
 
+    def test_trigger_weights_scale_contributions(self) -> None:
+        full = predict_cascade(self.graph, [("A", 0.0)], self.cutoff).set_index("region")
+        half = predict_cascade(self.graph, [("A", 0.0, 0.5)], self.cutoff).set_index("region")
+        self.assertAlmostEqual(half.loc["B", "probability"], full.loc["B", "probability"] / 2)
+        zero = predict_cascade(self.graph, [("A", 0.0, 0.0)], self.cutoff)
+        self.assertTrue(zero.empty)
+        clipped = predict_cascade(self.graph, [("A", 0.0, 5.0)], self.cutoff).set_index("region")
+        self.assertAlmostEqual(clipped.loc["B", "probability"], full.loc["B", "probability"])
+
     def test_triggers_without_history_and_empty(self) -> None:
         self.assertTrue(predict_cascade(self.graph, [("Z", 0.0)], self.cutoff).empty)
         self.assertTrue(predict_cascade(self.graph, [], self.cutoff).empty)
@@ -298,6 +308,33 @@ class WaveMapTests(unittest.TestCase):
         plt.close(fig)
 
 
+class OsintTriggerTests(unittest.TestCase):
+    def test_osint_triggers_from_record(self) -> None:
+        record = {
+            "threat_type": "uav_shahed", "wave_class": "slow", "source_region": "Kherson Oblast",
+            "target_regions": ["Mykolaiv Oblast", "Odesa Oblast", "Kherson Oblast"],
+            "confidence_score": 0.9,
+        }
+        triggers = osint_triggers(record)
+        self.assertEqual(triggers["region"].tolist(), ["Kherson Oblast", "Mykolaiv Oblast", "Odesa Oblast"])
+        self.assertEqual(triggers["role"].tolist(), ["source", "target", "target"])
+        self.assertTrue((triggers["weight"] == 0.9).all())
+        self.assertTrue((triggers["elapsed_min"] == 0.0).all())
+        # Without the source role, Kherson still appears because the record lists it as a target.
+        without_source = osint_triggers(record, include_source=False)
+        self.assertEqual(without_source["region"].tolist(),
+                         ["Mykolaiv Oblast", "Odesa Oblast", "Kherson Oblast"])
+        self.assertEqual(set(without_source["role"]), {"target"})
+
+    def test_external_origin_and_nationwide_records(self) -> None:
+        external = {"source_region": "Belgorod (RU)", "target_regions": ["Kharkiv Oblast"],
+                    "confidence_score": 0.95}
+        self.assertEqual(osint_triggers(external)["region"].tolist(), ["Kharkiv Oblast"])
+        nationwide = {"source_region": "Savasleyka (RU)", "target_regions": [], "confidence_score": 0.8}
+        self.assertTrue(osint_triggers(nationwide).empty)
+        self.assertEqual(list(osint_triggers({})), ["region", "elapsed_min", "weight", "role"])
+
+
 class HelperTests(unittest.TestCase):
     def test_resolve_source(self) -> None:
         self.assertEqual(resolve_source("synthetic", "x.csv"), ("synthetic", None))
@@ -376,6 +413,43 @@ class AppSmokeTests(unittest.TestCase):
         # Overview KPIs are absent; only the methodology tab's audit callouts remain.
         self.assertFalse(any(m.label == "Alarms before T" for m in at.metric))
         self.assertTrue(any(m.label == "Withheld (start ≥ T)" for m in at.metric))
+
+    def test_osint_parse_button_injects_triggers(self) -> None:
+        at = self._app().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        self.assertEqual(at.session_state["sim_trigger_mode"], "observed")
+        # Paste a slang message and press the action button (offline: no API key in tests).
+        message = "⚠️ Сумщина: 6 мопедів курсом на Полтавщину, швидкість ~150 км/год"
+        at.text_area(key="osint_text").set_value(message).run()
+        at.button(key="osint_run").click().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        record = at.session_state["osint_result"]
+        self.assertEqual(record["threat_type"], "uav_shahed")
+        self.assertEqual(record["source_region"], "Sumy Oblast")
+        self.assertEqual(record["target_regions"], ["Poltava Oblast"])
+        self.assertIn(record["parser"], ("rules", "synthetic"))
+        self.assertEqual(at.session_state["sim_trigger_mode"], "osint")
+        self.assertTrue(at.json, "parsed record should be shown as JSON")
+        trigger_tables = [d.value for d in at.dataframe if "role" in getattr(d.value, "columns", [])]
+        self.assertTrue(trigger_tables)
+        self.assertEqual(set(trigger_tables[0]["region"]), {"Sumy Oblast", "Poltava Oblast"})
+        prediction_tables = [d.value for d in at.dataframe if "via" in getattr(d.value, "columns", [])]
+        self.assertTrue(prediction_tables and len(prediction_tables[0]) > 0)
+        self.assertNotIn("Sumy Oblast", set(prediction_tables[0]["region"]))  # triggers never predicted
+        # Empty text produces a friendly warning, never an exception.
+        at.text_area(key="osint_text").set_value("   ").run()
+        at.button(key="osint_run").click().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        self.assertTrue(any("Paste a monitoring message" in str(w.value) for w in at.warning))
+
+    def test_osint_example_button_fills_text_area(self) -> None:
+        at = self._app().run()
+        at.button(key="osint_use_example").click().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        self.assertEqual(at.session_state["osint_text"], at.session_state["osint_example"])
+        at.button(key="osint_run").click().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        self.assertEqual(at.session_state["osint_result"]["parser"], "synthetic")
 
     def test_methodology_tab_renders_sections(self) -> None:
         at = self._app().run()
