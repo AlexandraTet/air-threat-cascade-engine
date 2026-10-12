@@ -59,6 +59,8 @@ import streamlit as st  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
+from src.config import get_settings  # noqa: E402
+from src.llm_parser import GeminiOSINTParser, demo_messages  # noqa: E402
 from src.loader import (  # noqa: E402
     THREAT_TYPES,
     UKRAINIAN_REGIONS,
@@ -1795,6 +1797,314 @@ def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Tim
 
 
 # --------------------------------------------------------------------------- #
+# 4b. Methodology & architecture tab (judge-facing)
+# --------------------------------------------------------------------------- #
+_PIPELINE_MERMAID: Final[str] = """
+flowchart LR
+    subgraph Sources
+        CSV[(Historical alarm CSV)]
+        SYN[Synthetic generator]
+        TG[Telegram OSINT text]
+    end
+    subgraph Safeguard["Temporal safeguard  (src/loader.py)"]
+        LD[Clean + canonical schema]
+        CUT{{"keep start_time < T<br/>mask end_time ≥ T"}}
+        TRIP[Leakage tripwire]
+    end
+    subgraph Fusion["OSINT fusion  (src/llm_parser.py)"]
+        GEM[Gemini 2.5 Flash<br/>JSON schema]
+        RUL[Rule-based parser]
+        VAL[Pydantic validation<br/>canonical oblasts]
+    end
+    subgraph Engine["Cascade engine  (src/dashboard.py)"]
+        FAST[Fast-wave graph<br/>Δ ≈ 30 min]
+        SLOW[Slow-wave graph<br/>Δ ≈ 90 min]
+        PRED[Top-K prediction<br/>noisy-OR + ETA]
+    end
+    CSV --> LD
+    SYN -. fallback .-> LD
+    LD --> CUT --> TRIP
+    TG --> GEM --> VAL
+    GEM -. key missing / error .-> RUL --> VAL
+    TRIP --> FAST & SLOW
+    VAL -- source / targets / wave --> PRED
+    FAST & SLOW --> PRED
+    PRED --> UI[Streamlit evaluation console]
+"""
+
+
+@st.cache_data(ttl="1h", show_spinner=False)
+def sample_osint_records() -> pd.DataFrame:
+    """Parse the built-in demo messages offline for the methodology showcase.
+
+    The parser is forced offline so this view never spends API quota or
+    depends on the network; it demonstrates the schema and the fallback path.
+
+    Returns:
+        One row per demo message with the key structured fields.
+    """
+    parser = GeminiOSINTParser(force_offline=True)
+    rows = []
+    for message, record in zip(demo_messages(), parser.parse_many(demo_messages())):
+        rows.append({
+            "message": message,
+            "threat_type": record.threat_type,
+            "wave_class": record.wave_class,
+            "source_region": record.source_region,
+            "target_regions": record.target_regions,
+            "confidence": record.confidence_score,
+            "engine": record.parser,
+        })
+    return pd.DataFrame(rows)
+
+
+def _layer_stat(graph: nx.DiGraph, key: str, reducer: Callable[[list[float]], float]) -> float:
+    values = [float(d.get(key, 0.0)) for _, _, d in graph.edges(data=True)]
+    return reducer(values) if values else 0.0
+
+
+def render_methodology_tab(
+    outcome: LoadOutcome,
+    cutoff: pd.Timestamp,
+    history: pd.DataFrame,
+    visible: pd.DataFrame,
+    wave_graphs: Mapping[str, nx.DiGraph],
+    params: CascadeParams,
+) -> None:
+    """Tab 4: methodology and architecture write-up for judges.
+
+    Every section pairs the explanation with live numbers from the current
+    slice so the guarantees can be checked, not just read.
+
+    Args:
+        outcome: Load outcome for the current ``T``.
+        cutoff: Observation instant ``T``.
+        history: Full history frame.
+        visible: Filtered, cutoff-safe alarm frame (may be empty).
+        wave_graphs: Per-wave graphs from :func:`build_wave_graphs`.
+        params: Cascade parameters from the sidebar.
+    """
+    settings = get_settings()
+    fast, slow = wave_graphs["fast"], wave_graphs["slow"]
+    observed_fast = fast.number_of_edges() if fast.graph.get("source") == "observed" else 0
+    observed_slow = slow.number_of_edges() if slow.graph.get("source") == "observed" else 0
+    max_start = visible["start_time"].max() if not visible.empty else None
+
+    st.markdown(
+        "**Multimodal Spatiotemporal Air-Threat Cascade & LLM Intelligence Engine** · a "
+        "leakage-safe, graph-based model of how air-raid alarms propagate between Ukrainian oblasts, "
+        "enriched with LLM-normalised OSINT. Everything on this page is recomputed from the sidebar "
+        "cutoff **T**, so the numbers below are a live audit of the current slice."
+    )
+
+    kpi = st.columns(5)
+    with kpi[0]:
+        st.metric("Visible before T", f"{len(outcome.frame):,}", border=True,
+                  help="Rows with start_time strictly before T (before threat filters).")
+    with kpi[1]:
+        st.metric("Withheld (start ≥ T)", f"{outcome.withheld_rows:,}", border=True,
+                  help="Future rows removed by the loader; they never reach any computation.")
+    with kpi[2]:
+        st.metric("Ends masked at T", f"{outcome.masked_end_rows:,}", border=True,
+                  help="Alarms still running at T whose end would be future knowledge.")
+    with kpi[3]:
+        st.metric("Edges fast · slow", f"{observed_fast:,} · {observed_slow:,}", border=True,
+                  help="Directed propagation edges learned from pre-T alarms per wave layer.")
+    with kpi[4]:
+        st.metric("OSINT parser", "Gemini" if settings.llm_enabled else "Offline",
+                  delta=settings.gemini_model if settings.llm_enabled else "rule-based (no API key)",
+                  delta_arrow="off", border=True,
+                  help="Live engine for Telegram OSINT parsing; falls back to rules automatically.")
+
+    with st.container(border=True):
+        st.subheader("End-to-end architecture", icon=":material/account_tree:")
+        st.mermaid_chart(_PIPELINE_MERMAID)
+        st.caption("Solid arrows: primary path. Dotted arrows: automatic fallbacks that keep the "
+                   "system running offline (synthetic data, rule-based OSINT parsing).")
+
+    # ---- 1. Graph diffusion ------------------------------------------------ #
+    with st.expander("1 · Spatiotemporal graph diffusion", icon=":material/hub:", expanded=True):
+        st.markdown(
+            "Each oblast is a **node**; a directed **edge A → B** records that an alarm in B began "
+            "within a wave-specific window Δ after an alarm in A for the same threat type. Edges "
+            "carry the *conditional spread probability* and the *historical transition speed*:"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.latex(r"P(B \mid A,\Delta_w)=\frac{N_{A\rightarrow B}(\Delta_w)}{N_A}")
+            st.caption("Share of A's alarms followed by B inside the window.")
+        with c2:
+            st.latex(r"\tau_{AB}=\operatorname{median}\big(t^{\text{start}}_B-t^{\text{start}}_A\big)")
+            st.caption("Median propagation lag in minutes (also mean and count).")
+        st.markdown(
+            "Given triggers active at T (region r, elapsed e_r minutes), each successor s receives a "
+            "recency-discounted contribution; several triggers combine with a noisy-OR, and the "
+            "arrival estimate is the remaining lag:"
+        )
+        st.latex(
+            r"p_{r\rightarrow s}=P(s\mid r)\,e^{-\max(0,\,e_r-\tau_{rs})/\lambda},\qquad "
+            r"P(s)=1-\prod_{r}\big(1-p_{r\rightarrow s}\big),\qquad "
+            r"\widehat{\text{ETA}}_s=\max(0,\tau_{rs}-e_r)"
+        )
+        st.markdown(
+            f"- λ (influence decay) is **{params.decay_min:.0f} min** and depth is "
+            f"**{params.hops} hop{'s' if params.hops > 1 else ''}** in the sidebar; two-hop paths "
+            "multiply probabilities and add lags.\n"
+            "- Node layout uses oblast-centre coordinates, so the graph reads as a map; node size is "
+            "alarm frequency before T.\n"
+            "- When a layer has no observed edges before T, a **prior adjacency topology** (dashed) "
+            "with distance-derived lags keeps the model explorable and is labelled as such."
+        )
+
+    # ---- 2. Velocity stratification ---------------------------------------- #
+    with st.expander("2 · Velocity stratification: fast-wave vs slow-wave", icon=":material/speed:"):
+        st.markdown(
+            "Alarm cascades have two very different kinematics, so the engine learns **two graphs** "
+            "instead of blending them:"
+        )
+        comparison = pd.DataFrame(
+            {
+                "Fast-wave": [
+                    "Ballistic & cruise missiles, strategic/tactical aviation, guided bombs, artillery",
+                    "Near-simultaneous multi-oblast activation (seconds to minutes)",
+                    f"{params.fast_lag_min:.0f} min",
+                    f"{_layer_stat(fast, 'median_lag_min', lambda v: float(np.median(v))):.0f} min",
+                    f"{_layer_stat(fast, 'probability', lambda v: float(np.mean(v))):.0%}",
+                    "Short alarms (≈15–60 min), few hops, radial from launch axis",
+                ],
+                "Slow-wave": [
+                    "Shahed-type strike UAVs, reconnaissance UAVs",
+                    "Progressive diffusion over 1–6 h as the group crosses oblasts",
+                    f"{params.max_lag_min:.0f} min",
+                    f"{_layer_stat(slow, 'median_lag_min', lambda v: float(np.median(v))):.0f} min",
+                    f"{_layer_stat(slow, 'probability', lambda v: float(np.mean(v))):.0%}",
+                    "Long alarms (1–3 h), multi-hop chains, strong night-time pattern",
+                ],
+            },
+            index=["Threat types", "Dynamics", "Edge window Δ", "Median lag before T",
+                   "Mean P(B | A) before T", "Signature"],
+        )
+        st.table(comparison)
+        st.caption(
+            "Live rows come from the current slice; layers marked *prior topology* on the wave map "
+            "report prior values. The split matters for prediction: a fast-wave trigger that is "
+            "already 20 min old has usually finished propagating, whereas a slow-wave trigger is "
+            "still mid-cascade."
+        )
+
+    # ---- 3. Temporal safeguard --------------------------------------------- #
+    with st.expander("3 · Strict temporal safeguard (no data leakage)", icon=":material/verified_user:"):
+        st.markdown(
+            "Evaluation at cutoff T only ever sees the dataset restricted to alarms that **started "
+            "strictly before T**. The restriction is applied in the loader, before any feature, "
+            "graph or prediction is computed, and is verified after the fact:"
+        )
+        st.latex(
+            r"\mathcal{D}_T=\{\,x\in\mathcal{D}:\ t^{\text{start}}_x<T\,\},\qquad "
+            r"t^{\text{end}}_x\leftarrow\text{NaT}\ \ \text{if}\ t^{\text{end}}_x\ge T,\qquad "
+            r"\max_{x\in\mathcal{D}_T}t^{\text{start}}_x<T\ \ (\text{tripwire})"
+        )
+        st.markdown(
+            "- **Strict inequality**: a row at exactly T is dropped (the boundary test asserts this).\n"
+            "- **End-time masking**: an alarm still running at T has an unknown end; its end and "
+            "duration are masked so no post-T information leaks through durations or 'active' status.\n"
+            "- **Tripwire**: `TemporalLeakageError` is raised if any surviving row violates the "
+            "inequality, so a regression fails loudly instead of silently inflating scores.\n"
+            "- **Timezones**: all timestamps are normalised to UTC; naive cutoffs are treated as UTC.\n"
+            "- The full history is loaded separately **only** for widget defaults and these audit "
+            "counters; nothing analytical is derived from it."
+        )
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.badge(f"T = {cutoff:%Y-%m-%d %H:%M} UTC", icon=":material/schedule:", color="blue")
+            if max_start is not None:
+                st.badge(f"latest visible start = {max_start:%Y-%m-%d %H:%M} UTC",
+                         icon=":material/check_circle:", color="green")
+                st.badge(f"margin {max(0.0, (cutoff - max_start).total_seconds() / 60):.0f} min",
+                         icon=":material/straighten:", color="gray")
+            else:
+                st.badge("no rows before T", icon=":material/hourglass_empty:", color="gray")
+        st.code(
+            "keep = df['start_time'] < cutoff            # strict: rows at T are dropped\n"
+            "out  = df.loc[keep]\n"
+            "out.loc[out['end_time'] >= cutoff, 'end_time'] = pd.NaT   # still running at T\n"
+            "assert (out['start_time'] < cutoff).all()    # TemporalLeakageError otherwise",
+            language="python",
+        )
+
+    # ---- 4. Multimodal OSINT fusion ---------------------------------------- #
+    with st.expander("4 · Multimodal OSINT fusion with Gemini", icon=":material/translate:"):
+        st.markdown(
+            "Monitoring channels post terse, slang-heavy updates (\"6 мопедів курсом на Полтавщину\"). "
+            "The engine normalises them into the same vocabulary as the alarm log so text can enrich "
+            "the tabular signal:\n\n"
+            "1. **Gemini 2.5 Flash** via the official `google-genai` SDK, temperature 0, forced JSON "
+            "output against a schema (`threat_type`, `source_region`, `target_regions`, "
+            "`confidence_score`, `raw_summary`, heading, count).\n"
+            "2. **Pydantic validation** canonicalises slang threat labels into the loader taxonomy, "
+            "derives `wave_class`, maps Ukrainian/Russian/English region spellings to oblasts, drops "
+            "external launch areas from targets, clamps confidence and records unmapped mentions.\n"
+            "3. **Graceful degradation**: missing/invalid key, SDK absent, timeouts or malformed JSON "
+            "fall back to a rule-based parser (and canned payloads for demo scenarios); a circuit "
+            "breaker stops retrying after repeated failures. The pipeline never crashes.\n"
+            "4. **Fusion**: parsed `source_region` / `target_regions` / `wave_class` become extra "
+            "triggers and priors for the cascade predictor, and `confidence_score` weights them."
+        )
+        st.caption("Offline showcase (rule-based engine, no API calls) over the built-in demo messages:")
+        st.dataframe(
+            sample_osint_records(),
+            hide_index=True,
+            column_config={
+                "message": st.column_config.TextColumn("Telegram message", width="large"),
+                "threat_type": "Threat",
+                "wave_class": "Wave",
+                "source_region": "Source",
+                "target_regions": st.column_config.ListColumn("Targets"),
+                "confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1,
+                                                              format="percent"),
+                "engine": "Engine",
+            },
+        )
+
+    # ---- 5. Evaluation protocol & limitations ------------------------------ #
+    with st.expander("5 · Evaluation protocol, fallbacks and limitations", icon=":material/fact_check:"):
+        st.markdown(
+            "**Backtest loop.** Pick T → load 𝒟_T → learn fast/slow graphs → take alarms active at T "
+            "as triggers → rank top-K next regions with ETAs → compare with what actually happened "
+            "after T (held-out by construction). The sidebar nudge buttons make this a one-click walk "
+            "through time.\n\n"
+            "**Fallbacks that keep the demo honest and alive.** Missing CSV → synthetic generator "
+            "(banner shown). No observed edges → prior adjacency topology (dashed, labelled). No API "
+            "key → rule-based OSINT parsing. No active alarms at T → what-if trigger mode.\n\n"
+            "**Known limitations.** Synthetic data mimics spatial skew, burst structure and diurnal "
+            "pattern but not real geopolitics; co-occurrence edges capture correlation, not causation; "
+            "the prior topology uses nominal speeds and probabilities; OSINT confidence is calibrated "
+            "heuristically in offline mode."
+        )
+
+    # ---- 6. Module map ------------------------------------------------------ #
+    with st.expander("6 · Module map", icon=":material/folder_code:"):
+        st.table(
+            {
+                ":material/database: `src/loader.py`":
+                    "CSV ingestion, cleaning, canonical schema, synthetic generator, **temporal cutoff** "
+                    "and leakage tripwire.",
+                ":material/settings: `src/config.py`":
+                    "Crash-proof settings from `.env`; missing `GEMINI_API_KEY` ⇒ offline mode.",
+                ":material/translate: `src/llm_parser.py`":
+                    "Gemini OSINT parser with schema-constrained JSON, Pydantic validation, rule-based "
+                    "fallback and circuit breaker.",
+                ":material/public: `src/dashboard.py`":
+                    "Fast/slow propagation graphs, cascade predictor, wave map, simulator and this "
+                    "methodology page.",
+                ":material/science: `tests/`":
+                    "Unit tests for every module plus headless end-to-end runs of the page via "
+                    "`streamlit.testing`.",
+            },
+            border="horizontal",
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 5. Page composition
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -1837,10 +2147,11 @@ def main() -> None:
     active = active_alarms(visible, cutoff)
     render_status_banner(outcome, cutoff, history, len(visible))
 
-    tab_overview, tab_map, tab_sim = st.tabs(
+    tab_overview, tab_map, tab_sim, tab_method = st.tabs(
         [":material/dashboard: Overview & metrics",
          ":material/public: Wave map & spatiotemporal graph",
-         ":material/model_training: Cascade simulator"]
+         ":material/model_training: Cascade simulator",
+         ":material/menu_book: Methodology & architecture"]
     )
     wave_graphs = build_wave_graphs(visible, params)
     if visible.empty:
@@ -1853,6 +2164,8 @@ def main() -> None:
             render_wave_map_tab(wave_graphs, visible, active, cutoff, params, empty_reason=reason)
         with tab_sim:
             render_empty_state(cutoff, history, reason=reason, slot="simulator")
+        with tab_method:
+            render_methodology_tab(outcome, cutoff, history, visible, wave_graphs, params)
         return
 
     graph = build_propagation_graph(visible, max_lag_min=params.max_lag_min)
@@ -1863,6 +2176,8 @@ def main() -> None:
         render_wave_map_tab(wave_graphs, visible, active, cutoff, params)
     with tab_sim:
         render_simulator_tab(graph, active, cutoff, params, regions)
+    with tab_method:
+        render_methodology_tab(outcome, cutoff, history, visible, wave_graphs, params)
 
 
 if __name__ == "__main__":

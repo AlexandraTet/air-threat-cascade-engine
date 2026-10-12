@@ -343,7 +343,9 @@ class AppSmokeTests(unittest.TestCase):
         self.assertFalse(at.exception, msg=str(at.exception))
         self.assertTrue(any("No alarms recorded before T" in str(i.value) for i in at.info))
         self.assertTrue(any("before the first recorded alarm" in str(w.value) for w in at.warning))
-        self.assertEqual(len(at.metric), 0)
+        # Overview KPIs are absent; only the methodology tab's audit callouts remain.
+        self.assertFalse(any(m.label == "Alarms before T" for m in at.metric))
+        self.assertTrue(any(m.label == "Withheld (start ≥ T)" for m in at.metric))
         # The wave map still renders on the default topology in what-if mode.
         self.assertTrue(any("Default topology in use" in str(w.value) or "default topology" in str(w.value)
                             for w in at.warning))
@@ -371,7 +373,26 @@ class AppSmokeTests(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception, msg=str(at.exception))
         self.assertTrue(any("threat filter hides" in str(i.value) for i in at.info))
-        self.assertEqual(len(at.metric), 0)
+        # Overview KPIs are absent; only the methodology tab's audit callouts remain.
+        self.assertFalse(any(m.label == "Alarms before T" for m in at.metric))
+        self.assertTrue(any(m.label == "Withheld (start ≥ T)" for m in at.metric))
+
+    def test_methodology_tab_renders_sections(self) -> None:
+        at = self._app().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        markdown = " ".join(str(m.value) for m in at.markdown)
+        # Expander titles are container labels, so check the section bodies instead.
+        for phrase in ("Each oblast is a **node**", "two graphs", "started strictly before T",
+                       "Gemini 2.5 Flash", "Backtest loop", "flowchart LR"):
+            self.assertIn(phrase, markdown, phrase)
+        self.assertTrue(at.latex, "formulas should be rendered with st.latex")
+        self.assertTrue(any("start_time" in str(c.value) for c in at.code))
+        self.assertTrue(any("Withheld" in str(m.label) for m in at.metric))
+        self.assertTrue(any("OSINT parser" in str(m.label) for m in at.metric))
+        # Offline OSINT showcase table is present and parsed with the rules/synthetic engines.
+        tables = [d.value for d in at.dataframe if "engine" in getattr(d.value, "columns", [])]
+        self.assertTrue(tables)
+        self.assertTrue(set(tables[0]["engine"]).issubset({"rules", "synthetic"}))
 
     def test_wave_map_trigger_controls(self) -> None:
         at = self._app().run()
