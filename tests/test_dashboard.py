@@ -19,19 +19,29 @@ from streamlit.testing.v1 import AppTest
 
 from src.dashboard import (
     PREDICTION_COLUMNS,
+    REGION_ADJACENCY,
+    CascadeParams,
     active_alarms,
     apply_threat_filters,
     build_propagation_graph,
+    build_wave_graphs,
     cascade_velocity,
     daily_wave_counts,
     default_cutoff,
+    default_topology_graph,
     edge_table,
+    haversine_km,
     hourly_onsets,
+    layer_summary,
+    node_activity,
     node_roles,
     predict_cascade,
     render_graph_figure,
+    render_wave_map_figure,
     resolve_source,
+    with_fallback_topology,
 )
+from src.loader import UKRAINIAN_REGIONS
 from src.loader import AirThreatLoader, generate_synthetic_alarms
 
 UTC = timezone.utc
@@ -197,6 +207,97 @@ class PredictionTests(unittest.TestCase):
         self.assertEqual(list(both["region"]), ["C"])  # A and B are triggers, never predicted
 
 
+class WaveMapTests(unittest.TestCase):
+    def test_adjacency_is_symmetric_and_connected(self) -> None:
+        self.assertEqual(set(REGION_ADJACENCY), set(UKRAINIAN_REGIONS))
+        for region, neighbours in REGION_ADJACENCY.items():
+            self.assertTrue(neighbours, region)
+            for other in neighbours:
+                self.assertIn(region, REGION_ADJACENCY[other], (region, other))
+        undirected = nx.Graph([(a, b) for a, ns in REGION_ADJACENCY.items() for b in ns])
+        self.assertTrue(nx.is_connected(undirected))
+        self.assertIn("Kyiv Oblast", REGION_ADJACENCY["Kyiv City"])
+        self.assertNotIn("Lviv Oblast", REGION_ADJACENCY["Kharkiv Oblast"])
+
+    def test_default_topology_lags_scale_with_wave_speed(self) -> None:
+        fast = default_topology_graph("fast")
+        slow = default_topology_graph("slow")
+        self.assertEqual(set(fast.nodes), set(UKRAINIAN_REGIONS))
+        self.assertEqual(fast.graph["source"], "prior")
+        self.assertTrue(fast.has_edge("Sumy Oblast", "Poltava Oblast"))
+        self.assertTrue(fast.has_edge("Poltava Oblast", "Sumy Oblast"))
+        f = fast["Sumy Oblast"]["Poltava Oblast"]
+        s = slow["Sumy Oblast"]["Poltava Oblast"]
+        self.assertLess(f["median_lag_min"], s["median_lag_min"])
+        self.assertTrue(f["prior"])
+        self.assertGreater(f["probability"], 0)
+        self.assertGreater(haversine_km((30.52, 50.45), (36.23, 49.99)), 350)  # Kyiv-Kharkiv ~410 km
+
+    def test_fallback_keeps_observed_graph_or_substitutes_prior(self) -> None:
+        observed = nx.DiGraph()
+        observed.add_node("Sumy Oblast", alarms=3)
+        observed.add_edge("Sumy Oblast", "Poltava Oblast", weight=2, median_lag_min=5.0,
+                          mean_lag_min=5.0, probability=0.7)
+        self.assertIs(with_fallback_topology(observed, "fast"), observed)
+        self.assertEqual(observed.graph["source"], "observed")
+        edgeless = nx.DiGraph()
+        edgeless.add_node("Sumy Oblast", alarms=4)
+        prior = with_fallback_topology(edgeless, "slow")
+        self.assertEqual(prior.graph["source"], "prior")
+        self.assertEqual(prior.nodes["Sumy Oblast"]["alarms"], 4)
+        self.assertGreater(prior.number_of_edges(), 50)
+
+    def test_build_wave_graphs_observed_and_empty(self) -> None:
+        df = generate_synthetic_alarms(1500, seed=8)
+        graphs = build_wave_graphs(df, CascadeParams())
+        self.assertEqual(set(graphs), {"fast", "slow"})
+        for wave, graph in graphs.items():
+            self.assertEqual(graph.graph["wave"], wave)
+            self.assertEqual(graph.graph["source"], "observed")
+            self.assertGreater(graph.number_of_edges(), 0)
+        self.assertEqual(graphs["fast"].graph["lag_window_min"], 30.0)
+        self.assertEqual(graphs["slow"].graph["lag_window_min"], 90.0)
+        empty = build_wave_graphs(df.iloc[0:0], CascadeParams())
+        self.assertTrue(all(g.graph["source"] == "prior" for g in empty.values()))
+        summary = layer_summary(empty)
+        self.assertEqual(summary["source"].tolist(), ["prior topology", "prior topology"])
+
+    def test_node_activity_windows(self) -> None:
+        df = generate_synthetic_alarms(800, seed=2)
+        cutoff = df["start_time"].iloc[600]
+        all_before = node_activity(df, cutoff, window_hours=None)
+        recent = node_activity(df, cutoff, window_hours=6)
+        self.assertEqual(int(all_before.sum()), 800)
+        self.assertLess(int(recent.sum()), int(all_before.sum()))
+        self.assertTrue(node_activity(df.iloc[0:0], cutoff, window_hours=24).empty)
+
+    def test_prediction_on_prior_topology_reaches_neighbours(self) -> None:
+        prior = default_topology_graph("slow")
+        pred = predict_cascade(prior, [("Kherson Oblast", 0.0)], _ts("2026-01-01 00:00"), top_k=5)
+        self.assertEqual(set(pred["region"]), set(REGION_ADJACENCY["Kherson Oblast"]))
+        self.assertTrue((pred["eta_min"] > 0).all())
+
+    def test_render_wave_map_figure_variants(self) -> None:
+        empty = build_wave_graphs(generate_synthetic_alarms(50, seed=1).iloc[0:0], CascadeParams())
+        fig = render_wave_map_figure(empty, layers=["fast", "slow"], activity=pd.Series(dtype="int64"))
+        self.assertEqual(len(fig.axes), 1)
+        plt.close(fig)
+        df = generate_synthetic_alarms(1200, seed=3)
+        cutoff = df["start_time"].iloc[900]
+        graphs = build_wave_graphs(df, CascadeParams())
+        pred = predict_cascade(graphs["slow"], [("Kherson Oblast", 10.0)], cutoff, top_k=4)
+        fig = render_wave_map_figure(
+            graphs, layers=["slow"], activity=node_activity(df, cutoff, window_hours=24),
+            active_regions=["Kherson Oblast"], trigger="Kherson Oblast", predictions=pred,
+            min_probability=0.05, show_edge_labels=True, dark=True,
+        )
+        self.assertEqual(len(fig.axes), 1)
+        plt.close(fig)
+        fig = render_wave_map_figure(graphs, layers=[], activity=pd.Series(dtype="int64"),
+                                     show_edge_labels=False, show_node_labels=False)
+        plt.close(fig)
+
+
 class HelperTests(unittest.TestCase):
     def test_resolve_source(self) -> None:
         self.assertEqual(resolve_source("synthetic", "x.csv"), ("synthetic", None))
@@ -243,6 +344,11 @@ class AppSmokeTests(unittest.TestCase):
         self.assertTrue(any("No alarms recorded before T" in str(i.value) for i in at.info))
         self.assertTrue(any("before the first recorded alarm" in str(w.value) for w in at.warning))
         self.assertEqual(len(at.metric), 0)
+        # The wave map still renders on the default topology in what-if mode.
+        self.assertTrue(any("Default topology in use" in str(w.value) or "default topology" in str(w.value)
+                            for w in at.warning))
+        self.assertTrue(at.selectbox(key="wm_whatif_region"))
+        self.assertTrue(at.dataframe)  # predictions + layer summary tables
         # The one-click recovery button must bring the data back.
         at.button(key="empty_reset_overview").click().run()
         self.assertFalse(at.exception, msg=str(at.exception))
@@ -266,6 +372,23 @@ class AppSmokeTests(unittest.TestCase):
         self.assertFalse(at.exception, msg=str(at.exception))
         self.assertTrue(any("threat filter hides" in str(i.value) for i in at.info))
         self.assertEqual(len(at.metric), 0)
+
+    def test_wave_map_trigger_controls(self) -> None:
+        at = self._app().run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        trigger_box = at.selectbox(key="wm_trigger")
+        self.assertGreaterEqual(len(trigger_box.options), 2)  # active alarms + what-if
+        self.assertNotIn("What-if", str(trigger_box.value))
+        # Switch to what-if mode and pick a fast-wave trigger with two hops.
+        trigger_box.select(trigger_box.options[-1]).run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        at.selectbox(key="wm_whatif_region").select("Sumy Oblast").run()
+        at.slider(key="wm_top_k").set_value(10).run()
+        self.assertFalse(at.exception, msg=str(at.exception))
+        self.assertTrue(at.toggle(key="wm_edge_labels").value)
+        at.toggle(key="wm_edge_labels").set_value(False).run()
+        at.slider(key="wm_min_prob").set_value(0.85).run()  # may hide every edge: must not crash
+        self.assertFalse(at.exception, msg=str(at.exception))
 
     def test_nudge_buttons_move_cutoff(self) -> None:
         at = self._app().run()

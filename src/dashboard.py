@@ -146,8 +146,12 @@ class CascadeParams:
     """Tunable parameters of the propagation model.
 
     Attributes:
-        max_lag_min: Two alarms of the same threat type form a directed edge
-            when the second starts within this many minutes of the first.
+        max_lag_min: Slow-wave lag window. Two alarms of the same threat type
+            form a directed edge when the second starts within this many
+            minutes of the first. Also used for the mixed-wave simulator graph.
+        fast_lag_min: Lag window for the fast-wave layer (ballistic / aviation
+            alarms cascade within minutes, so a tight window avoids spurious
+            long-range edges).
         min_edge_weight: Edges observed fewer times than this are hidden in
             the graph view (they still contribute to predictions).
         decay_min: E-folding time (minutes) by which a trigger's influence
@@ -156,6 +160,7 @@ class CascadeParams:
     """
 
     max_lag_min: float = 90.0
+    fast_lag_min: float = 30.0
     min_edge_weight: int = 2
     decay_min: float = 60.0
     hops: int = 1
@@ -788,6 +793,343 @@ def render_graph_figure(
     return fig
 
 
+# --------------------------------------------------------------------------- #
+# 3c. Wave map: per-wave layers, default topology fallback, activity sizing
+# --------------------------------------------------------------------------- #
+WAVE_SPEED_KMH: Final[Mapping[str, float]] = {"fast": 900.0, "slow": 150.0}
+"""Nominal propagation speed per wave class used for prior lag estimates."""
+
+WAVE_PRIOR_PROBABILITY: Final[Mapping[str, float]] = {"fast": 0.35, "slow": 0.45}
+"""Transition probability assigned to adjacency edges in the prior topology."""
+
+# Undirected geographic adjacency between oblasts (Kyiv City sits inside Kyiv
+# Oblast). Used only to build the fallback topology when no data exists.
+_ADJACENT_PAIRS: Final[Sequence[tuple[str, str]]] = (
+    ("Volyn Oblast", "Rivne Oblast"), ("Volyn Oblast", "Lviv Oblast"),
+    ("Rivne Oblast", "Lviv Oblast"), ("Rivne Oblast", "Ternopil Oblast"),
+    ("Rivne Oblast", "Khmelnytskyi Oblast"), ("Rivne Oblast", "Zhytomyr Oblast"),
+    ("Lviv Oblast", "Ternopil Oblast"), ("Lviv Oblast", "Ivano-Frankivsk Oblast"),
+    ("Lviv Oblast", "Zakarpattia Oblast"), ("Zakarpattia Oblast", "Ivano-Frankivsk Oblast"),
+    ("Ivano-Frankivsk Oblast", "Ternopil Oblast"), ("Ivano-Frankivsk Oblast", "Chernivtsi Oblast"),
+    ("Ternopil Oblast", "Khmelnytskyi Oblast"), ("Ternopil Oblast", "Chernivtsi Oblast"),
+    ("Chernivtsi Oblast", "Khmelnytskyi Oblast"), ("Chernivtsi Oblast", "Vinnytsia Oblast"),
+    ("Khmelnytskyi Oblast", "Zhytomyr Oblast"), ("Khmelnytskyi Oblast", "Vinnytsia Oblast"),
+    ("Zhytomyr Oblast", "Vinnytsia Oblast"), ("Zhytomyr Oblast", "Kyiv Oblast"),
+    ("Vinnytsia Oblast", "Kyiv Oblast"), ("Vinnytsia Oblast", "Cherkasy Oblast"),
+    ("Vinnytsia Oblast", "Kirovohrad Oblast"), ("Vinnytsia Oblast", "Odesa Oblast"),
+    ("Kyiv Oblast", "Kyiv City"), ("Kyiv Oblast", "Chernihiv Oblast"),
+    ("Kyiv Oblast", "Poltava Oblast"), ("Kyiv Oblast", "Cherkasy Oblast"),
+    ("Chernihiv Oblast", "Sumy Oblast"), ("Chernihiv Oblast", "Poltava Oblast"),
+    ("Sumy Oblast", "Poltava Oblast"), ("Sumy Oblast", "Kharkiv Oblast"),
+    ("Poltava Oblast", "Kharkiv Oblast"), ("Poltava Oblast", "Dnipropetrovsk Oblast"),
+    ("Poltava Oblast", "Kirovohrad Oblast"), ("Poltava Oblast", "Cherkasy Oblast"),
+    ("Cherkasy Oblast", "Kirovohrad Oblast"), ("Kirovohrad Oblast", "Dnipropetrovsk Oblast"),
+    ("Kirovohrad Oblast", "Mykolaiv Oblast"), ("Kirovohrad Oblast", "Odesa Oblast"),
+    ("Kharkiv Oblast", "Dnipropetrovsk Oblast"), ("Kharkiv Oblast", "Donetsk Oblast"),
+    ("Kharkiv Oblast", "Luhansk Oblast"), ("Luhansk Oblast", "Donetsk Oblast"),
+    ("Donetsk Oblast", "Dnipropetrovsk Oblast"), ("Donetsk Oblast", "Zaporizhzhia Oblast"),
+    ("Dnipropetrovsk Oblast", "Zaporizhzhia Oblast"), ("Dnipropetrovsk Oblast", "Kherson Oblast"),
+    ("Dnipropetrovsk Oblast", "Mykolaiv Oblast"), ("Zaporizhzhia Oblast", "Kherson Oblast"),
+    ("Kherson Oblast", "Mykolaiv Oblast"), ("Mykolaiv Oblast", "Odesa Oblast"),
+)
+
+
+def _build_adjacency(pairs: Sequence[tuple[str, str]]) -> dict[str, tuple[str, ...]]:
+    adjacency: dict[str, list[str]] = {region: [] for region in UKRAINIAN_REGIONS}
+    for a, b in pairs:
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+    return {region: tuple(sorted(set(neighbours))) for region, neighbours in adjacency.items()}
+
+
+REGION_ADJACENCY: Final[Mapping[str, tuple[str, ...]]] = _build_adjacency(_ADJACENT_PAIRS)
+"""Symmetric oblast adjacency derived from :data:`_ADJACENT_PAIRS`."""
+
+
+def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle distance between two ``(lon, lat)`` points in kilometres."""
+    lon1, lat1 = math.radians(a[0]), math.radians(a[1])
+    lon2, lat2 = math.radians(b[0]), math.radians(b[1])
+    d_lat = lat2 - lat1
+    d_lon = lon2 - lon1
+    h = math.sin(d_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(d_lon / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(h))
+
+
+def default_topology_graph(wave: str) -> nx.DiGraph:
+    """Prior propagation graph built from oblast adjacency.
+
+    Used when no observed propagation exists before ``T`` (for example when
+    ``T`` precedes the data, the CSV is missing, or the threat filter hides
+    everything). Every adjacency pair becomes two directed edges with a
+    distance-derived lag (``distance / WAVE_SPEED_KMH``) and the wave's prior
+    transition probability. Edges carry ``prior=True`` and the graph carries
+    ``graph.graph["source"] == "prior"`` so the UI can label them honestly.
+
+    Args:
+        wave: ``"fast"`` or ``"slow"`` (anything else uses mid values).
+
+    Returns:
+        A :class:`networkx.DiGraph` over all :data:`UKRAINIAN_REGIONS`.
+    """
+    speed = WAVE_SPEED_KMH.get(wave, 300.0)
+    probability = WAVE_PRIOR_PROBABILITY.get(wave, 0.3)
+    graph = nx.DiGraph(wave=wave, source="prior", lag_window_min=None)
+    for region in UKRAINIAN_REGIONS:
+        graph.add_node(region, alarms=0)
+    for a, b in _ADJACENT_PAIRS:
+        lag = max(2.0, haversine_km(REGION_COORDS[a], REGION_COORDS[b]) / speed * 60.0)
+        for u, v in ((a, b), (b, a)):
+            graph.add_edge(u, v, weight=1, median_lag_min=round(lag, 1), mean_lag_min=round(lag, 1),
+                           probability=probability, prior=True)
+    return graph
+
+
+def with_fallback_topology(graph: nx.DiGraph, wave: str) -> nx.DiGraph:
+    """Return ``graph`` if it has edges, else the prior topology for ``wave``.
+
+    Observed node alarm counts are preserved on the prior graph so node sizing
+    still reflects whatever activity exists.
+
+    Args:
+        graph: Observed propagation graph (possibly edgeless).
+        wave: Wave class for the prior.
+
+    Returns:
+        A graph that always has edges; ``graph.graph["source"]`` is
+        ``"observed"`` or ``"prior"``.
+    """
+    if graph.number_of_edges() > 0:
+        graph.graph.setdefault("source", "observed")
+        graph.graph.setdefault("wave", wave)
+        return graph
+    prior = default_topology_graph(wave)
+    for node, data in graph.nodes(data=True):
+        if node in prior:
+            prior.nodes[node]["alarms"] = int(data.get("alarms", 0))
+        else:
+            prior.add_node(node, alarms=int(data.get("alarms", 0)))
+    prior.graph["lag_window_min"] = graph.graph.get("lag_window_min")
+    return prior
+
+
+def build_wave_graphs(df: pd.DataFrame, params: CascadeParams) -> dict[str, nx.DiGraph]:
+    """Build one propagation graph per wave class, each with a safe fallback.
+
+    Args:
+        df: Cutoff-filtered (and threat-filtered) alarm frame; may be empty.
+        params: Lag windows per wave come from here.
+
+    Returns:
+        ``{"fast": graph, "slow": graph}``. Each graph has edges: observed
+        ones when the data supports them, otherwise the prior topology.
+    """
+    graphs: dict[str, nx.DiGraph] = {}
+    for wave, lag in ((ThreatWave.FAST.value, params.fast_lag_min),
+                      (ThreatWave.SLOW.value, params.max_lag_min)):
+        subset = df.loc[df["wave_class"] == wave] if not df.empty else df
+        observed = build_propagation_graph(subset, max_lag_min=lag)
+        observed.graph.update(wave=wave, source="observed", lag_window_min=lag)
+        graphs[wave] = with_fallback_topology(observed, wave)
+    return graphs
+
+
+def node_activity(df: pd.DataFrame, cutoff: pd.Timestamp, *,
+                  window_hours: Optional[float]) -> pd.Series:
+    """Alarm onsets per region in the trailing window before ``T``.
+
+    Args:
+        df: Cutoff-filtered alarm frame.
+        cutoff: Observation instant ``T``.
+        window_hours: Trailing window; ``None`` counts all history before ``T``.
+
+    Returns:
+        Integer series indexed by region, descending, named ``alarms``.
+    """
+    if df.empty:
+        return pd.Series(dtype="int64", name="alarms")
+    frame = df if window_hours is None else df.loc[
+        df["start_time"] >= cutoff - pd.Timedelta(hours=window_hours)
+    ]
+    return frame["region"].value_counts().rename("alarms")
+
+
+def render_wave_map_figure(
+    graphs: Mapping[str, nx.DiGraph],
+    *,
+    layers: Sequence[str],
+    activity: pd.Series,
+    active_regions: Sequence[str] = (),
+    trigger: Optional[str] = None,
+    predictions: Optional[pd.DataFrame] = None,
+    min_probability: float = 0.0,
+    max_edges_per_layer: int = 60,
+    show_edge_labels: bool = True,
+    max_labels: int = 18,
+    show_node_labels: bool = True,
+    title: str = "",
+    dark: bool = False,
+) -> Figure:
+    """Draw fast- and slow-wave propagation layers on one geographic map.
+
+    Nodes are oblasts sized by ``activity`` (alarm frequency before ``T``).
+    Each layer draws its strongest edges in the wave colour, width scaled by
+    transition probability and opacity by observation count; prior-topology
+    edges are dashed. Edge labels show ``probability · lag``. Regions active
+    at ``T`` are filled red, the selected trigger gets a star, and predicted
+    targets are orange with their arrival estimate annotated.
+
+    Args:
+        graphs: Per-wave graphs from :func:`build_wave_graphs`.
+        layers: Wave classes to draw (``"fast"``, ``"slow"``).
+        activity: Region -> alarm count used for node sizing.
+        active_regions: Regions with an alarm active at ``T``.
+        trigger: Region selected as the simulation trigger.
+        predictions: Output of :func:`predict_cascade` for the trigger.
+        min_probability: Hide edges below this transition probability.
+        max_edges_per_layer: Strongest edges kept per layer.
+        show_edge_labels: Annotate the strongest edges.
+        max_labels: Cap on annotated edges across layers.
+        show_node_labels: Draw region names.
+        title: Figure title.
+        dark: Use light text for dark app themes.
+
+    Returns:
+        A transparent-background matplotlib figure owned by the caller.
+    """
+    text_color = "#E6E6E6" if dark else "#222222"
+    fig, ax = plt.subplots(figsize=(11, 7))
+    fig.patch.set_alpha(0.0)
+    ax.set_facecolor("none")
+    ax.set_axis_off()
+    if title:
+        ax.set_title(title, color=text_color, fontsize=12, loc="left")
+
+    union = nx.DiGraph()
+    for graph in graphs.values():
+        union.add_nodes_from(graph.nodes)
+    for region in UKRAINIAN_REGIONS:
+        union.add_node(region)
+    pos = layout_positions(union)
+    nodes = list(union.nodes)
+
+    counts = np.asarray([float(activity.get(n, 0.0)) if len(activity) else 0.0 for n in nodes])
+    peak = counts.max() if counts.size and counts.max() > 0 else 1.0
+    sizes = 110 + 1100 * (counts / peak)
+
+    predicted: dict[str, tuple[float, float]] = {}
+    if predictions is not None and not predictions.empty:
+        predicted = {str(r.region): (float(r.probability), float(r.eta_min))
+                     for r in predictions.itertuples(index=False)}
+    active_set = set(active_regions)
+    fill, alpha = [], []
+    for node in nodes:
+        if node == trigger:
+            fill.append("#FFD166"); alpha.append(1.0)
+        elif node in predicted:
+            fill.append("#F2A541"); alpha.append(0.45 + 0.55 * predicted[node][0])
+        elif node in active_set:
+            fill.append("#D1495B"); alpha.append(0.95)
+        else:
+            fill.append("#B8C2CC"); alpha.append(0.85)
+
+    label_budget = max_labels
+    for wave in layers:
+        graph = graphs.get(wave)
+        if graph is None or graph.number_of_edges() == 0:
+            continue
+        edges = sorted(
+            (e for e in graph.edges(data=True) if e[2].get("probability", 0.0) >= min_probability),
+            key=lambda e: (e[2].get("weight", 1), e[2].get("probability", 0.0)),
+            reverse=True,
+        )[:max_edges_per_layer]
+        if not edges:
+            continue
+        weights = np.asarray([e[2].get("weight", 1) for e in edges], dtype=float)
+        probs = np.asarray([e[2].get("probability", 0.0) for e in edges], dtype=float)
+        prior = graph.graph.get("source") == "prior"
+        style = "dashed" if prior else "solid"
+        rad = 0.08 if wave == "fast" else 0.22
+        nx.draw_networkx_edges(
+            graph, pos, edgelist=[(u, v) for u, v, _ in edges],
+            width=list(0.6 + 3.4 * probs),
+            alpha=0.25 if prior else None,
+            edge_color=[(*matplotlib.colors.to_rgb(WAVE_COLORS[wave]),
+                         0.3 + 0.6 * w / weights.max()) for w in weights] if not prior else WAVE_COLORS[wave],
+            style=style, arrows=True, arrowstyle="-|>", arrowsize=10,
+            connectionstyle=f"arc3,rad={rad}", node_size=list(sizes), ax=ax,
+        )
+        if show_edge_labels and label_budget > 0:
+            labelled = edges[:label_budget]
+            label_budget -= len(labelled)
+            nx.draw_networkx_edge_labels(
+                graph, pos,
+                edge_labels={(u, v): f"{d['probability']:.0%}·{d['median_lag_min']:.0f}m"
+                             for u, v, d in labelled},
+                font_size=6.5, font_color=WAVE_COLORS[wave], label_pos=0.5,
+                bbox={"alpha": 0.0}, connectionstyle=f"arc3,rad={rad}", ax=ax,
+            )
+
+    if trigger and predicted:
+        route_graph = nx.DiGraph()
+        route_graph.add_edges_from((trigger, target) for target in predicted if trigger in pos)
+        nx.draw_networkx_edges(
+            route_graph, pos, width=[1.5 + 3.0 * predicted[v][0] for _, v in route_graph.edges],
+            edge_color="#F2A541", alpha=0.9, arrows=True, arrowstyle="-|>", arrowsize=14,
+            connectionstyle="arc3,rad=0.12", node_size=list(sizes), ax=ax,
+        )
+        for target, (_, eta) in predicted.items():
+            if target in pos:
+                x, y = pos[target]
+                ax.annotate(f"+{eta:.0f} min", (x, y), xytext=(0, 11), textcoords="offset points",
+                            ha="center", fontsize=7.5, color="#B86B00", fontweight="bold")
+
+    nx.draw_networkx_nodes(union, pos, nodelist=nodes, node_size=list(sizes), node_color=fill,
+                           alpha=alpha, linewidths=0.8, edgecolors=text_color, ax=ax)
+    if trigger and trigger in pos:
+        ax.scatter([pos[trigger][0]], [pos[trigger][1]], marker="*", s=420, color="#FFD166",
+                   edgecolors="#8A5A00", linewidths=0.9, zorder=5)
+    if show_node_labels:
+        nx.draw_networkx_labels(union, pos, labels={n: short_region_name(n) for n in nodes},
+                                font_size=7.5, font_color=text_color, ax=ax)
+    ax.margins(0.08)
+
+    handles = [
+        Line2D([0], [0], color=WAVE_COLORS["fast"], lw=3, label="Fast-wave edge (prob · lag)"),
+        Line2D([0], [0], color=WAVE_COLORS["slow"], lw=3, label="Slow-wave edge (prob · lag)"),
+        Line2D([0], [0], color="#777777", lw=2, linestyle="dashed", label="Prior topology (no data)"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#B8C2CC", markersize=9,
+               label="Region (size = alarm frequency before T)"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#D1495B", markersize=9,
+               label="Active at T"),
+        Line2D([0], [0], marker="*", color="none", markerfacecolor="#FFD166", markersize=13,
+               label="Selected trigger"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#F2A541", markersize=9,
+               label="Predicted target (+ETA)"),
+    ]
+    ax.legend(handles=handles, loc="lower left", fontsize=7.5, frameon=False, labelcolor=text_color,
+              ncol=2)
+    return fig
+
+
+def layer_summary(graphs: Mapping[str, nx.DiGraph]) -> pd.DataFrame:
+    """One row per wave layer: node/edge counts, mean probability, median lag, source."""
+    rows = []
+    for wave, graph in graphs.items():
+        probs = [d.get("probability", 0.0) for _, _, d in graph.edges(data=True)]
+        lags = [d.get("median_lag_min", 0.0) for _, _, d in graph.edges(data=True)]
+        rows.append({
+            "layer": WAVE_LABELS.get(wave, wave),
+            "source": "observed" if graph.graph.get("source") == "observed" else "prior topology",
+            "lag_window_min": graph.graph.get("lag_window_min"),
+            "regions": graph.number_of_nodes(),
+            "edges": graph.number_of_edges(),
+            "mean_probability": float(np.mean(probs)) if probs else 0.0,
+            "median_lag_min": float(np.median(lags)) if lags else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
 def _theme_is_dark() -> bool:
     """Best-effort detection of the active Streamlit theme."""
     try:
@@ -970,7 +1312,10 @@ def render_cascade_controls() -> CascadeParams:
         The chosen :class:`CascadeParams`.
     """
     with st.expander("Cascade model", icon=":material/hub:", expanded=False):
-        max_lag = st.slider("Max propagation lag (min)", 15, 240, 90, step=15, key="max_lag")
+        max_lag = st.slider("Slow-wave lag window (min)", 15, 240, 90, step=15, key="max_lag",
+                            help="UAV / Shahed alarms: window for A → B co-occurrence edges.")
+        fast_lag = st.slider("Fast-wave lag window (min)", 5, 90, 30, step=5, key="fast_lag",
+                             help="Ballistic / aviation alarms: window for A → B edges.")
         min_weight = st.slider("Min edge count shown", 1, 15, 2, key="min_edge_weight")
         decay = st.slider("Trigger influence decay (min)", 15, 240, 60, step=15, key="decay_min")
         hops = st.segmented_control(
@@ -979,6 +1324,7 @@ def render_cascade_controls() -> CascadeParams:
         )
     return CascadeParams(
         max_lag_min=float(max_lag),
+        fast_lag_min=float(fast_lag),
         min_edge_weight=int(min_weight),
         decay_min=float(decay),
         hops=int(hops) if hops in (1, 2) else 1,
@@ -1173,63 +1519,182 @@ def render_overview_tab(df: pd.DataFrame, active: pd.DataFrame, cutoff: pd.Times
         )
 
 
-def render_graph_tab(graph: nx.DiGraph, active: pd.DataFrame, params: CascadeParams) -> None:
-    """Tab 2: propagation graph figure plus corridor and role tables.
+_ACTIVITY_WINDOWS: Final[Mapping[str, Optional[float]]] = {
+    "6 h": 6.0, "24 h": 24.0, "72 h": 72.0, "All before T": None,
+}
+_WHAT_IF_OPTION: Final[str] = "What-if: choose any region"
+
+
+def _trigger_label(row: Any) -> str:
+    return f"{row.region} · {str(row.threat_type).replace('_', ' ')} · +{row.elapsed_min:.0f} min"
+
+
+def render_wave_map_tab(
+    graphs: Mapping[str, nx.DiGraph],
+    visible: pd.DataFrame,
+    active: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    params: CascadeParams,
+    *,
+    empty_reason: Optional[str] = None,
+) -> None:
+    """Tab 2: layered wave map with an interactive single-trigger simulation.
+
+    Always renders: when no observed propagation exists for a layer the prior
+    adjacency topology is drawn (dashed) and labelled as such, and when no
+    alarm is active at ``T`` the trigger selector falls back to what-if mode.
 
     Args:
-        graph: Propagation graph from the visible data.
-        active: Alarms active at ``T`` (highlighted in red).
+        graphs: Per-wave graphs from :func:`build_wave_graphs`.
+        visible: Filtered, cutoff-safe alarm frame (may be empty).
+        active: Alarms active at ``T`` (may be empty).
+        cutoff: Observation instant ``T``.
         params: Cascade parameters from the sidebar.
+        empty_reason: Explanation shown when ``visible`` is empty.
     """
     st.caption(
-        f"Edge A → B counts how often B alarmed within {params.max_lag_min:.0f} min after A for "
-        "the same threat type. Layout uses oblast-centre coordinates. Only pre-T alarms feed the graph."
+        "Directed edges A → B: empirical transition probability P(B | A) and median propagation "
+        f"lag. Fast-wave window {params.fast_lag_min:.0f} min, slow-wave window "
+        f"{params.max_lag_min:.0f} min. Nodes are oblasts sized by alarm frequency before T; "
+        "layout uses oblast-centre coordinates. Only pre-T alarms feed the layers."
     )
-    with st.container(horizontal=True, vertical_alignment="bottom"):
-        max_edges = st.slider("Strongest edges shown", 10, 200, 60, step=10, key="graph_max_edges")
-        show_labels = st.toggle("Region labels", value=True, key="graph_labels")
+    if empty_reason:
+        st.info(f"{empty_reason}. The map shows the default adjacency topology so the model can "
+                "still be explored.", icon=":material/map:")
+    prior_layers = [WAVE_LABELS[w] for w, g in graphs.items() if g.graph.get("source") == "prior"]
+    if prior_layers:
+        st.warning(
+            "No observed propagation before T for: " + "; ".join(prior_layers) + ". Those layers "
+            "show the default topology (dashed edges) with prior probabilities and distance-based lags.",
+            icon=":material/alt_route:", title="Default topology in use",
+        )
 
-    if graph.number_of_edges() == 0:
-        st.info("No propagation edges yet: fewer than two same-type alarms fall inside the lag window "
-                "before T. Widen the lag in the sidebar or move T later.", icon=":material/hub:")
-    highlight = {str(r): ("#D1495B", 1.0) for r in active["region"].unique()}
-    fig = render_graph_figure(
-        graph, highlight=highlight, min_weight=params.min_edge_weight, max_edges=max_edges,
-        show_labels=show_labels, title="Regional propagation graph (before T)", dark=_theme_is_dark(),
+    with st.container(horizontal=True, vertical_alignment="bottom", gap="medium"):
+        chosen_layers = st.pills(
+            "Layers", options=["fast", "slow"], default=["fast", "slow"], selection_mode="multi",
+            format_func=lambda w: "Fast-wave" if w == "fast" else "Slow-wave", key="wm_layers",
+        )
+        window_label = st.segmented_control(
+            "Node size: activity window", options=list(_ACTIVITY_WINDOWS), default="24 h",
+            required=True, key="wm_activity_window",
+        )
+        min_probability = st.slider("Min transition probability", 0.0, 0.9, 0.1, step=0.05,
+                                    key="wm_min_prob", format="%.2f")
+        max_edges = st.slider("Edges per layer", 10, 150, 50, step=10, key="wm_max_edges")
+    with st.container(horizontal=True, gap="medium"):
+        edge_labels = st.toggle("Edge labels (prob · lag)", value=True, key="wm_edge_labels")
+        node_labels = st.toggle("Region labels", value=True, key="wm_node_labels")
+
+    layers = list(chosen_layers) if isinstance(chosen_layers, list) else []
+    activity = node_activity(visible, cutoff, window_hours=_ACTIVITY_WINDOWS.get(str(window_label), 24.0))
+
+    # ---- trigger selection ------------------------------------------------ #
+    with st.container(border=True):
+        st.subheader("Propagation wave from a trigger", icon=":material/waves:")
+        trigger_rows = active.sort_values("elapsed_min") if not active.empty else active
+        options = [_trigger_label(r) for r in trigger_rows.itertuples(index=False)] + [_WHAT_IF_OPTION]
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="medium"):
+            choice = st.selectbox("Active trigger at T", options, index=0, key="wm_trigger",
+                                  help="Alarms active at T, most recent first; or pick any region.")
+            top_k = st.slider("Top-K targets", 3, 12, 6, key="wm_top_k")
+        if choice == _WHAT_IF_OPTION or trigger_rows.empty:
+            if trigger_rows.empty:
+                st.caption("No alarm is active at T, so the simulation runs in what-if mode.")
+            with st.container(horizontal=True, vertical_alignment="bottom", gap="medium"):
+                trigger = st.selectbox("Trigger region", list(UKRAINIAN_REGIONS), key="wm_whatif_region")
+                wave = st.segmented_control("Wave", options=["fast", "slow"], default="slow",
+                                            required=True, key="wm_whatif_wave",
+                                            format_func=lambda w: "Fast-wave" if w == "fast" else "Slow-wave")
+                elapsed = float(st.slider("Minutes since onset", 0, 180, 0, step=5, key="wm_whatif_elapsed"))
+            wave = str(wave) if wave in ("fast", "slow") else "slow"
+        else:
+            row = trigger_rows.iloc[options.index(choice)]
+            trigger = str(row["region"])
+            wave = str(row["wave_class"]) if row["wave_class"] in ("fast", "slow") else "slow"
+            elapsed = float(row["elapsed_min"])
+
+        graph = graphs[wave]
+        predictions = predict_cascade(graph, [(trigger, elapsed)], cutoff, top_k=top_k,
+                                      hops=params.hops, decay_min=params.decay_min)
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.badge(f"Trigger: {trigger}", icon=":material/my_location:", color="orange")
+            st.badge("Fast-wave" if wave == "fast" else "Slow-wave", icon=":material/speed:",
+                     color="red" if wave == "fast" else "blue")
+            st.badge(f"+{elapsed:.0f} min since onset", icon=":material/timer:", color="gray")
+            st.badge("observed graph" if graph.graph.get("source") == "observed" else "prior topology",
+                     icon=":material/hub:", color="green" if graph.graph.get("source") == "observed" else "violet")
+
+    fig = render_wave_map_figure(
+        graphs, layers=layers, activity=activity, active_regions=list(active["region"].unique()),
+        trigger=trigger, predictions=predictions, min_probability=float(min_probability),
+        max_edges_per_layer=int(max_edges), show_edge_labels=bool(edge_labels),
+        show_node_labels=bool(node_labels),
+        title=f"Wave map at T = {cutoff:%Y-%m-%d %H:%M} UTC", dark=_theme_is_dark(),
     )
     st.pyplot(fig)
     plt.close(fig)
 
-    col_edges, col_roles = st.columns((3, 2))
-    with col_edges, st.container(border=True):
-        st.subheader("Strongest corridors", icon=":material/alt_route:")
-        corridors = edge_table(graph, min_weight=params.min_edge_weight, limit=20)
+    col_pred, col_layers = st.columns((3, 2))
+    with col_pred, st.container(border=True):
+        st.subheader(f"Top-{top_k} predicted targets", icon=":material/trending_up:")
+        if predictions.empty:
+            st.info("The trigger has no outgoing edges in this layer. Lower the minimum probability, "
+                    "widen the lag window, or choose two hops.", icon=":material/hub:")
+        else:
+            st.dataframe(
+                predictions[["region", "probability", "eta_min", "eta_time", "hops", "paths"]],
+                hide_index=True,
+                column_config={
+                    "region": "Region",
+                    "probability": st.column_config.ProgressColumn("Probability", min_value=0,
+                                                                   max_value=1, format="percent"),
+                    "eta_min": st.column_config.NumberColumn("ETA (min)", format="%.0f"),
+                    "eta_time": st.column_config.DatetimeColumn("Est. arrival (UTC)", format="HH:mm"),
+                    "hops": st.column_config.NumberColumn("Hops", format="%d"),
+                    "paths": st.column_config.NumberColumn("Paths", format="%d"),
+                },
+            )
+    with col_layers, st.container(border=True):
+        st.subheader("Layer summary", icon=":material/layers:")
         st.dataframe(
-            corridors,
-            hide_index=True,
+            layer_summary(graphs), hide_index=True,
             column_config={
-                "source": "From",
-                "target": "To",
-                "co_occurrences": st.column_config.NumberColumn("Count", format="%d"),
+                "layer": "Layer", "source": "Source",
+                "lag_window_min": st.column_config.NumberColumn("Window (min)", format="%.0f"),
+                "regions": st.column_config.NumberColumn("Regions", format="%d"),
+                "edges": st.column_config.NumberColumn("Edges", format="%d"),
+                "mean_probability": st.column_config.NumberColumn("Mean P", format="percent"),
                 "median_lag_min": st.column_config.NumberColumn("Median lag (min)", format="%.0f"),
-                "probability": st.column_config.ProgressColumn("P(to | from)", min_value=0,
-                                                               max_value=1, format="percent"),
             },
         )
-    with col_roles, st.container(border=True):
-        st.subheader("Cascade roles", icon=":material/swap_calls:")
-        sources, sinks = node_roles(graph)
-        role_cols = st.columns(2)
-        with role_cols[0]:
-            st.markdown("**Top sources**")
-            st.dataframe(sources, hide_index=True,
-                         column_config={"region": "Region",
-                                        "weighted_degree": st.column_config.NumberColumn("Out", format="%d")})
-        with role_cols[1]:
-            st.markdown("**Top sinks**")
-            st.dataframe(sinks, hide_index=True,
-                         column_config={"region": "Region",
-                                        "weighted_degree": st.column_config.NumberColumn("In", format="%d")})
+
+    with st.expander("Corridors and roles by layer", icon=":material/alt_route:"):
+        for wave_key in ("fast", "slow"):
+            layer_graph = graphs[wave_key]
+            st.markdown(f"**{WAVE_LABELS[wave_key]}** · "
+                        f"{'observed' if layer_graph.graph.get('source') == 'observed' else 'prior topology'}")
+            corridors = edge_table(layer_graph, min_weight=1 if layer_graph.graph.get("source") == "prior"
+                                   else params.min_edge_weight, limit=12)
+            sources, sinks = node_roles(layer_graph, top_n=5)
+            c1, c2 = st.columns((3, 2))
+            with c1:
+                st.dataframe(
+                    corridors, hide_index=True,
+                    column_config={
+                        "source": "From", "target": "To",
+                        "co_occurrences": st.column_config.NumberColumn("Count", format="%d"),
+                        "median_lag_min": st.column_config.NumberColumn("Lag (min)", format="%.0f"),
+                        "probability": st.column_config.ProgressColumn("P(to | from)", min_value=0,
+                                                                       max_value=1, format="percent"),
+                    },
+                )
+            with c2:
+                roles = sources.rename(columns={"weighted_degree": "out"}).merge(
+                    sinks.rename(columns={"weighted_degree": "in"}), on="region", how="outer").fillna(0)
+                st.dataframe(roles, hide_index=True,
+                             column_config={"region": "Region",
+                                            "out": st.column_config.NumberColumn("Out", format="%d"),
+                                            "in": st.column_config.NumberColumn("In", format="%d")})
 
 
 def render_simulator_tab(graph: nx.DiGraph, active: pd.DataFrame, cutoff: pd.Timestamp,
@@ -1372,25 +1837,30 @@ def main() -> None:
     active = active_alarms(visible, cutoff)
     render_status_banner(outcome, cutoff, history, len(visible))
 
-    tab_overview, tab_graph, tab_sim = st.tabs(
+    tab_overview, tab_map, tab_sim = st.tabs(
         [":material/dashboard: Overview & metrics",
-         ":material/hub: Spatiotemporal graph",
+         ":material/public: Wave map & spatiotemporal graph",
          ":material/model_training: Cascade simulator"]
     )
+    wave_graphs = build_wave_graphs(visible, params)
     if visible.empty:
         reason = ("No alarms recorded before T" if outcome.frame.empty
                   else "The threat filter hides every alarm before T")
-        for slot, tab in (("overview", tab_overview), ("graph", tab_graph), ("simulator", tab_sim)):
-            with tab:
-                render_empty_state(cutoff, history, reason=reason, slot=slot)
+        with tab_overview:
+            render_empty_state(cutoff, history, reason=reason, slot="overview")
+        with tab_map:
+            # The wave map always renders: default topology + what-if simulation.
+            render_wave_map_tab(wave_graphs, visible, active, cutoff, params, empty_reason=reason)
+        with tab_sim:
+            render_empty_state(cutoff, history, reason=reason, slot="simulator")
         return
 
     graph = build_propagation_graph(visible, max_lag_min=params.max_lag_min)
     regions = [r for r in UKRAINIAN_REGIONS if r in set(history["region"])] or sorted(history["region"].unique())
     with tab_overview:
         render_overview_tab(visible, active, cutoff)
-    with tab_graph:
-        render_graph_tab(graph, active, params)
+    with tab_map:
+        render_wave_map_tab(wave_graphs, visible, active, cutoff, params)
     with tab_sim:
         render_simulator_tab(graph, active, cutoff, params, regions)
 
