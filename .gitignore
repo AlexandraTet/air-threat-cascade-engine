@@ -1,0 +1,65 @@
+# --- Secrets & local environment ------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.toml
+
+# --- Streamlit --------------------------------------------------------------
+# Local Streamlit state (secrets, credentials, caches). The shared theme file
+# is deliberately kept under version control.
+.streamlit/
+!.streamlit/config.toml
+
+# --- Python virtual environments -------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# --- Caches & build artefacts ----------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+.eggs/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- Databases & data dumps -------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.parquet
+data/*.csv
+!data/sample_*.csv
+
+# --- Logs & temporary files -------------------------------------------------
+logs/
+*.log
+*.log.*
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+tmp/
+temp/
+
+# --- IDE / OS ---------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
